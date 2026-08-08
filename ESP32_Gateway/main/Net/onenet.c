@@ -4,9 +4,9 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_netif.h"
+#include "esp_netif_sntp.h"
+#include "esp_tls.h"
 #include "nvs_flash.h"
-#include "lwip/sockets.h"
-#include "lwip/netdb.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -23,8 +23,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <string.h>
-#include <errno.h>
-#include <fcntl.h>
+#include <time.h>
 
 #include "cJSON.h"
 #include "lora_receiver.h"
@@ -39,13 +38,22 @@
 
 
 #define TAG                      "OneNET"
-#define MQTT_PORT                1883
-#define MQTT_HOST                "mqtts.heclouds.com"
+#define MQTT_PORT                8883
+#define MQTT_HOST                "mqttstls.heclouds.com"
+/*
+ * OneNET MQTTS uses an official self-signed server certificate whose
+ * Subject/CN is "OneNET MQTTS" rather than the access hostname. ESP-TLS
+ * still verifies the embedded CA/certificate and this exact name; do not
+ * set skip_common_name to true.
+ */
+#define MQTT_SERVER_CERT_NAME    "OneNET MQTTS"
 
 #define RX_BUF_SIZE              1024
-#define ONENET_TCP_TIMEOUT_MS     10000U
+#define ONENET_TLS_TIMEOUT_MS     ((uint32_t)CONFIG_AIR_GATEWAY_ONENET_TLS_TIMEOUT_MS)
 #define ONENET_CONNACK_TIMEOUT_MS 5000U
 #define ONENET_RETRY_MAX_MS      30000U
+#define ONENET_SNTP_RETRY_MS      30000U
+#define ONENET_MIN_VALID_UNIX_TIME 1704067200LL /* 2024-01-01 00:00:00 UTC */
 
 // MQTT 心跳间隔（秒），OneNET 要求不大于300s
 #define MQTT_KEEPALIVE_SEC        240
@@ -55,7 +63,7 @@ static uint32_t g_last_ping = 0;
 /* 全局变量                                                                   */
 /*---------------------------------------------------------------------------*/
 volatile uint8_t OneNet_Ready = 0;
-static int g_sock = -1;
+static esp_tls_t *g_tls;
 static unsigned char g_rx_buf[RX_BUF_SIZE + 1U];
 static unsigned char g_rx_frame[RX_BUF_SIZE + 1U];
 static size_t g_rx_used;
@@ -63,7 +71,6 @@ static size_t g_rx_used;
 typedef enum
 {
     ONENET_MQTT_IDLE = 0,
-    ONENET_MQTT_TCP_CONNECTING,
     ONENET_MQTT_WAIT_CONNACK,
     ONENET_MQTT_READY
 } onenet_mqtt_state_t;
@@ -78,9 +85,14 @@ static uint8_t g_wifi_retry_count;
 static uint8_t g_mqtt_retry_count;
 static uint32_t g_wifi_retry_due_ms;
 static uint32_t g_mqtt_retry_due_ms;
-static uint32_t g_tcp_deadline_ms;
 static uint32_t g_connack_deadline_ms;
+static uint32_t g_sntp_retry_due_ms;
+static bool g_sntp_initialized;
 static onenet_mqtt_state_t g_mqtt_state = ONENET_MQTT_IDLE;
+
+/* CMake embeds the official OneNET root certificate as a NUL-terminated PEM. */
+extern const uint8_t onenet_root_ca_pem_start[] asm("_binary_onenet_root_ca_pem_start");
+extern const uint8_t onenet_root_ca_pem_end[] asm("_binary_onenet_root_ca_pem_end");
 
 static uint32_t onenet_now_ms(void)
 {
@@ -103,10 +115,10 @@ static uint32_t onenet_retry_delay_ms(uint8_t retry_count)
 
 static void onenet_close_socket(void)
 {
-    if (g_sock >= 0)
+    if (g_tls != NULL)
     {
-        close(g_sock);
-        g_sock = -1;
+        esp_tls_conn_destroy(g_tls);
+        g_tls = NULL;
     }
 
     OneNet_Ready = 0;
@@ -275,111 +287,101 @@ static void OneNET_GenToken(char *token, unsigned short token_len)
 /*===========================================================================*/
 /* Socket TCP 通信（替代ESP8266 AT指令）                                        */
 /*===========================================================================*/
-/* Returns 1 when connected now, 0 while TCP is connecting, and -1 on error. */
-static int socket_connect_start(const char *host, uint16_t port, int *sock_out)
+/* Establish and verify TLS in the dedicated network task. */
+static int onenet_tls_connect(void)
 {
-    int sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    struct hostent *he;
-    struct sockaddr_in dest = {0};
+    const esp_tls_cfg_t tls_cfg = {
+        .cacert_buf = onenet_root_ca_pem_start,
+        .cacert_bytes = (unsigned int)(onenet_root_ca_pem_end - onenet_root_ca_pem_start),
+        .common_name = MQTT_SERVER_CERT_NAME,
+        .skip_common_name = false,
+        /* Keep read/write non-blocking after the verified handshake. */
+        .non_block = true,
+        .timeout_ms = (int)ONENET_TLS_TIMEOUT_MS,
+        .tls_version = ESP_TLS_VER_TLS_1_2,
+    };
 
-    *sock_out = -1;
-    if (sock < 0)
-    {
-        return -1;
-    }
-
-    /* DNS can take time, but this function only runs in the dedicated network
-     * task so it never stalls LoRa reception or OLED refreshes. */
-    he = gethostbyname(host);
-    if (he == NULL)
-    {
-        close(sock);
-        return -1;
-    }
-
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(port);
-    memcpy(&dest.sin_addr, he->h_addr, he->h_length);
-
-    if (fcntl(sock, F_SETFL, O_NONBLOCK) < 0)
-    {
-        close(sock);
-        return -1;
-    }
-
-    *sock_out = sock;
-    if (connect(sock, (struct sockaddr *)&dest, sizeof(dest)) == 0)
-    {
-        return 1;
-    }
-
-    if (errno == EINPROGRESS || errno == EALREADY)
-    {
-        return 0;
-    }
-
-    close(sock);
-    *sock_out = -1;
-    return -1;
+    /* This bounded call only runs in onenet_network_task, never in the Wi-Fi
+     * event callback or the LoRa/OLED scheduler tasks. */
+    return esp_tls_conn_new_sync(MQTT_HOST, (int)strlen(MQTT_HOST),
+                                 MQTT_PORT, &tls_cfg, g_tls);
 }
 
-static int socket_connect_complete(int sock)
+static bool onenet_clock_is_valid(void)
 {
-    int socket_error = 0;
-    socklen_t socket_error_len = sizeof(socket_error);
-    struct timeval timeout = {0};
-    fd_set write_fds;
-    fd_set error_fds;
-    int select_result;
+    time_t now;
 
-    FD_ZERO(&write_fds);
-    FD_ZERO(&error_fds);
-    FD_SET(sock, &write_fds);
-    FD_SET(sock, &error_fds);
-    select_result = select(sock + 1, NULL, &write_fds, &error_fds, &timeout);
-    if (select_result == 0)
+    time(&now);
+    return (int64_t)now >= ONENET_MIN_VALID_UNIX_TIME;
+}
+
+/* TLS certificate validation needs a real clock.  SNTP is started and
+ * retried asynchronously from the dedicated network task; no event callback
+ * waits for time synchronization. */
+static bool onenet_ensure_time_synced(uint32_t now_ms)
+{
+    esp_err_t result;
+
+    if (onenet_clock_is_valid())
     {
-        return 0;
-    }
-    if (select_result < 0)
-    {
-        return -1;
+        return true;
     }
 
-    if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &socket_error, &socket_error_len) < 0)
+    if (!onenet_time_reached(now_ms, g_sntp_retry_due_ms))
     {
-        return -1;
+        return false;
     }
 
-    return (socket_error == 0) ? 1 : -1;
+    if (!g_sntp_initialized)
+    {
+        esp_sntp_config_t sntp_cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+        result = esp_netif_sntp_init(&sntp_cfg);
+        if (result == ESP_OK)
+        {
+            g_sntp_initialized = true;
+            ESP_LOGI(TAG, "SNTP started; waiting for a valid clock before TLS");
+        }
+        else
+        {
+            ESP_LOGW(TAG, "SNTP init failed: %s", esp_err_to_name(result));
+        }
+    }
+    else
+    {
+        result = esp_netif_sntp_start();
+        if (result != ESP_OK)
+        {
+            ESP_LOGW(TAG, "SNTP retry failed: %s", esp_err_to_name(result));
+        }
+    }
+
+    g_sntp_retry_due_ms = now_ms + ONENET_SNTP_RETRY_MS;
+    return false;
 }
 
 /* Send one complete MQTT frame. This function is only called by the dedicated
  * network task, so a short retry window cannot delay LoRa or OLED work. */
-static int socket_send(int sock, const unsigned char *data, int len)
+static int tls_send(const unsigned char *data, int len)
 {
     int sent = 0;
     const uint32_t deadline_ms = onenet_now_ms() + 250U;
 
-    if (data == NULL || len <= 0)
+    if (g_tls == NULL || data == NULL || len <= 0)
     {
         return -1;
     }
 
     while (sent < len)
     {
-        const int result = send(sock, data + sent, len - sent, 0);
+        const int result = (int)esp_tls_conn_write(g_tls, data + sent,
+                                                    (size_t)(len - sent));
 
         if (result > 0)
         {
             sent += result;
             continue;
         }
-        if (result < 0 && errno == EINTR)
-        {
-            continue;
-        }
-        if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        if (result == ESP_TLS_ERR_SSL_WANT_READ || result == ESP_TLS_ERR_SSL_WANT_WRITE)
         {
             if (onenet_time_reached(onenet_now_ms(), deadline_ms))
             {
@@ -395,9 +397,10 @@ static int socket_send(int sock, const unsigned char *data, int len)
 }
 
 /* >0 bytes received, 0 no data, -2 orderly peer close, -1 socket error. */
-static int socket_recv(int sock, unsigned char *buf, int len)
+static int tls_recv(unsigned char *buf, int len)
 {
-    const int result = recv(sock, buf, len, 0);
+    const int result = (g_tls != NULL) ?
+        (int)esp_tls_conn_read(g_tls, buf, (size_t)len) : -1;
 
     if (result > 0)
     {
@@ -407,7 +410,7 @@ static int socket_recv(int sock, unsigned char *buf, int len)
     {
         return -2;
     }
-    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+    if (result == ESP_TLS_ERR_SSL_WANT_READ || result == ESP_TLS_ERR_SSL_WANT_WRITE)
     {
         return 0;
     }
@@ -415,8 +418,8 @@ static int socket_recv(int sock, unsigned char *buf, int len)
     return -1;
 }
 
-/* Append currently available TCP data to the MQTT stream accumulator.
- * MQTT is a byte stream: one recv() may contain half a packet or many packets. */
+/* Append available TLS payload data to the MQTT stream accumulator.
+ * MQTT is a byte stream: one read() may contain half a packet or many packets. */
 static int onenet_receive_stream(void)
 {
     int result;
@@ -426,8 +429,7 @@ static int onenet_receive_stream(void)
         return -1;
     }
 
-    result = socket_recv(g_sock,
-                         &g_rx_buf[g_rx_used],
+    result = tls_recv(&g_rx_buf[g_rx_used],
                          (int)(RX_BUF_SIZE - g_rx_used));
     if (result > 0)
     {
@@ -538,7 +540,7 @@ static bool onenet_send_connect_request(uint32_t now_ms)
         return false;
     }
 
-    send_result = socket_send(g_sock, mqtt_packet._data, (int)mqtt_packet._len);
+    send_result = tls_send(mqtt_packet._data, (int)mqtt_packet._len);
     MQTT_DeleteBuffer(&mqtt_packet);
     if (send_result <= 0)
     {
@@ -592,38 +594,32 @@ static void onenet_process_connection(uint32_t now_ms)
             return;
         }
 
-        ESP_LOGI(TAG, "Connecting to MQTT broker...");
-        connect_result = socket_connect_start(MQTT_HOST, MQTT_PORT, &g_sock);
+        if (!onenet_ensure_time_synced(now_ms))
+        {
+            return;
+        }
+
+        ESP_LOGI(TAG, "Connecting to OneNET MQTTS broker...");
+        g_tls = esp_tls_init();
+        if (g_tls == NULL)
+        {
+            onenet_schedule_mqtt_retry(now_ms, "TLS context allocation failed");
+            return;
+        }
+
+        connect_result = onenet_tls_connect();
         if (connect_result < 0)
         {
-            onenet_schedule_mqtt_retry(now_ms, "TCP connect start failed");
+            onenet_schedule_mqtt_retry(now_ms, "TLS handshake or server certificate validation failed");
         }
-        else if (connect_result == 0)
+        else if (connect_result == 1)
         {
-            g_mqtt_state = ONENET_MQTT_TCP_CONNECTING;
-            g_tcp_deadline_ms = now_ms + ONENET_TCP_TIMEOUT_MS;
+            ESP_LOGI(TAG, "TLS established; OneNET CA and certificate name verified");
+            (void)onenet_send_connect_request(now_ms);
         }
         else
         {
-            (void)onenet_send_connect_request(now_ms);
-        }
-        return;
-    }
-
-    if (g_mqtt_state == ONENET_MQTT_TCP_CONNECTING)
-    {
-        connect_result = socket_connect_complete(g_sock);
-        if (connect_result < 0)
-        {
-            onenet_schedule_mqtt_retry(now_ms, "TCP connect failed");
-        }
-        else if (connect_result > 0)
-        {
-            (void)onenet_send_connect_request(now_ms);
-        }
-        else if (onenet_time_reached(now_ms, g_tcp_deadline_ms))
-        {
-            onenet_schedule_mqtt_retry(now_ms, "TCP connect timeout");
+            onenet_schedule_mqtt_retry(now_ms, "Unexpected TLS handshake status");
         }
         return;
     }
@@ -717,7 +713,8 @@ void OneNet_Init(const char *wifi_ssid, const char *wifi_password)
     g_network_initialized = true;
     g_mqtt_retry_due_ms = onenet_now_ms();
 
-    if (xTaskCreate(onenet_network_task, "onenet_net", 6144U, NULL, 4U, NULL) != pdPASS)
+    /* TLS handshake and certificate parsing run only in this network task. */
+    if (xTaskCreate(onenet_network_task, "onenet_net", 8192U, NULL, 4U, NULL) != pdPASS)
     {
         ESP_LOGE(TAG, "Failed to create OneNET network task");
         g_network_initialized = false;
@@ -742,7 +739,7 @@ void OneNet_SendData(void)
     int json_length;
     int send_result;
 
-    if (!OneNet_Ready || g_sock < 0)
+    if (!OneNet_Ready || g_tls == NULL)
     {
         return;
     }
@@ -841,7 +838,7 @@ void OneNet_SendData(void)
     memcpy(&mqtt_packet._data[mqtt_packet._len], json, (size_t)json_length);
     mqtt_packet._len += (uint32_t)json_length;
 
-    send_result = socket_send(g_sock, mqtt_packet._data, (int)mqtt_packet._len);
+    send_result = tls_send(mqtt_packet._data, (int)mqtt_packet._len);
     MQTT_DeleteBuffer(&mqtt_packet);
 
     if (send_result < 0)
@@ -885,15 +882,13 @@ void OneNET_Publish(const char *topic, const char *msg)
     MQTT_PACKET_STRUCTURE mqtt_packet = {NULL, 0, 0, 0};
     int send_result;
 
-    if (!OneNet_Ready || (g_sock < 0) || (topic == NULL) || (msg == NULL))
+    if (!OneNet_Ready || (g_tls == NULL) || (topic == NULL) || (msg == NULL))
         return;
-
-    printf("Publish Topic: %s, Msg: %s\r\n", topic, msg);
 
     if (MQTT_PacketPublish(MQTT_PUBLISH_ID, topic, msg, strlen(msg),
                            MQTT_QOS_LEVEL0, 0, 1, &mqtt_packet) == 0)
     {
-        send_result = socket_send(g_sock, mqtt_packet._data, (int)mqtt_packet._len);
+        send_result = tls_send(mqtt_packet._data, (int)mqtt_packet._len);
         MQTT_DeleteBuffer(&mqtt_packet);
         if (send_result < 0)
         {
@@ -920,14 +915,14 @@ void OneNET_Subscribe(void)
     const char *topic = topic_buf;
     int send_result;
 
-    if (!OneNet_Ready || (g_sock < 0))
+    if (!OneNet_Ready || (g_tls == NULL))
         return;
 
     snprintf(topic_buf, sizeof(topic_buf), "$sys/%s/%s/thing/property/set", PROID, DEVICE_NAME);
 
     if (MQTT_PacketSubscribe(MQTT_SUBSCRIBE_ID, MQTT_QOS_LEVEL0, &topic, 1, &mqtt_packet) == 0)
     {
-        send_result = socket_send(g_sock, mqtt_packet._data, (int)mqtt_packet._len);
+        send_result = tls_send(mqtt_packet._data, (int)mqtt_packet._len);
         MQTT_DeleteBuffer(&mqtt_packet);
         if (send_result <= 0)
         {
@@ -975,20 +970,13 @@ void OneNet_RevPro(unsigned char *cmd)
                                           &req_payload, &req_len, &qos, &pkt_id);
             if (result == 0)
             {
-                printf("OneNET Recv: %s\r\n", req_payload);
-
                 raw_json = cJSON_Parse(req_payload);
                 if (raw_json)
                 {
                     params_json = cJSON_GetObjectItem(raw_json, "params");
                     if (params_json)
                     {
-                        char *params_text = cJSON_PrintUnformatted(params_json);
-                        if (params_text)
-                        {
-                            printf("Params: %s\r\n", params_text);
-                            free(params_text);
-                        }
+                        ESP_LOGI(TAG, "Received OneNET property-set command");
                     }
 
                     cJSON *id_json = cJSON_GetObjectItem(raw_json, "id");
@@ -1016,15 +1004,12 @@ void OneNet_RevPro(unsigned char *cmd)
             break;
 
         case MQTT_PKT_PUBACK:
-            if (MQTT_UnPacketPublishAck(cmd) == 0)
-                printf("Tips:    MQTT Publish Send OK\r\n");
+            (void)MQTT_UnPacketPublishAck(cmd);
             break;
 
         case MQTT_PKT_SUBACK:
-            if (MQTT_UnPacketSubscribe(cmd) == 0)
-                printf("Tips:    MQTT Subscribe OK\r\n");
-            else
-                printf("Tips:    MQTT Subscribe Err\r\n");
+            if (MQTT_UnPacketSubscribe(cmd) != 0)
+                ESP_LOGW(TAG, "OneNET command subscription was rejected");
             break;
 
         default:
@@ -1060,7 +1045,7 @@ void OneNet_ProcessLoop(void)
     size_t frame_length;
 
     if (g_socket_close_pending || g_mqtt_state != ONENET_MQTT_READY ||
-        !g_wifi_connected || !OneNet_Ready || g_sock < 0)
+        !g_wifi_connected || !OneNet_Ready || g_tls == NULL)
     {
         onenet_process_connection(now_ms);
         return;
@@ -1071,7 +1056,7 @@ void OneNet_ProcessLoop(void)
         MQTT_PACKET_STRUCTURE ping_packet = {NULL, 0, 0, 0};
         if (MQTT_PacketPing(&ping_packet) == 0)
         {
-            const int send_result = socket_send(g_sock, ping_packet._data, (int)ping_packet._len);
+            const int send_result = tls_send(ping_packet._data, (int)ping_packet._len);
             MQTT_DeleteBuffer(&ping_packet);
             if (send_result <= 0)
             {

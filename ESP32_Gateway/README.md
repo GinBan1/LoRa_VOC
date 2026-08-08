@@ -1,6 +1,6 @@
 # ESP32 LoRa 网关
 
-此目录是空气质量监测项目的 ESP32 接收端：接收 STM32F407 通过 E22-400M22S（SX1268）发送的遥测帧，显示关键状态，并经 Wi-Fi 上传至 OneNET MQTT。
+此目录是空气质量监测项目的 ESP32 接收端：接收 STM32F407 通过 E22-400M22S（SX1268）发送的遥测帧，显示关键状态，并经 Wi-Fi 通过 OneNET MQTTS 上传。
 
 > 凭据不在源码中保存。请通过 `menuconfig` 写入本机的 `sdkconfig`；不要提交该文件。
 
@@ -90,4 +90,6 @@ AQ1,seq,uptime_ms,flags,temp_x10,humidity_x10,pressure_x10,sraw_voc,voc_index,ai
 
 ## 当前网络安全边界
 
-当前 OneNET 连接使用 TCP 1883，已实现异步重连、发送完整性处理以及 MQTT TCP 半包/粘包缓存，但链路本身没有 TLS 加密。它可用于本项目的原型联调；公网或长期部署前应改用 OneNET 支持的 TLS 接口、校验证书，并轮换已有设备密钥。LoRa 的 private sync word 与 CRC 同样不提供加密或发送端身份认证。
+OneNET 连接固定使用 `mqttstls.heclouds.com:8883`。项目在构建时内嵌 `certs/onenet_root_ca.pem`，使用 ESP-IDF `esp-tls`/mbedTLS 校验 OneNET 自签名服务器证书链，并校验证书标识 `OneNET MQTTS`。OneNET 的证书 CN 不等于接入域名，因此不会声称或执行错误的 DNS 主机名匹配；也绝不会降级回明文 1883 或跳过证书校验。TLS 握手只在独立网络任务中执行，首次联网会先通过 SNTP 获取有效时间，因而不会阻塞 LoRa 接收或 OLED 刷新。请在 OneNET 或证书轮换时同步更新该 CA 文件并重新构建。LoRa 的 private sync word 与 CRC 同样不提供加密或发送端身份认证。
+
+串口日志不会输出 Wi-Fi 密码、Access Key、Token、完整 MQTT Topic、JSON 遥测内容或云端下行参数；保留启动、Wi-Fi/MQTT 重连、TLS 证书校验、MQTT 连接状态和每次遥测上报摘要，便于现场定位问题而不泄露凭据。
