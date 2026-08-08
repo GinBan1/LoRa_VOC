@@ -2,6 +2,142 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
+#include <rt_sys.h>
+
+/*
+ * The project uses the full Arm C library (not MicroLib).  Without a complete
+ * _sys_* retarget layer the library falls back to semihosting and executes
+ * BKPT 0xAB before main(), which only works while a debugger is attached.
+ */
+#if defined(__ARMCC_VERSION)
+/* ArmClang 6: retaining a reference enables the library's link-time guard. */
+__attribute__((used)) static void (*const no_semihosting_guard)(void) =
+    __use_no_semihosting;
+#endif
+
+#define UART_FH_STDIN   ((FILEHANDLE)0x8001)
+#define UART_FH_STDOUT  ((FILEHANDLE)0x8002)
+#define UART_FH_STDERR  ((FILEHANDLE)0x8003)
+
+const char __stdin_name[]  = ":STDIN";
+const char __stdout_name[] = ":STDOUT";
+const char __stderr_name[] = ":STDERR";
+
+static int uart_stdio_ready(void)
+{
+    return (huart1.Instance == USART1) &&
+           (huart1.gState != HAL_UART_STATE_RESET);
+}
+
+FILEHANDLE _sys_open(const char *name, int openmode)
+{
+    (void)openmode;
+
+    if (name == NULL) {
+        return -1;
+    }
+    if (strcmp(name, __stdin_name) == 0) {
+        return UART_FH_STDIN;
+    }
+    if (strcmp(name, __stdout_name) == 0) {
+        return UART_FH_STDOUT;
+    }
+    if (strcmp(name, __stderr_name) == 0) {
+        return UART_FH_STDERR;
+    }
+    return -1;
+}
+
+int _sys_close(FILEHANDLE fh)
+{
+    return ((fh == UART_FH_STDIN) || (fh == UART_FH_STDOUT) ||
+            (fh == UART_FH_STDERR)) ? 0 : -1;
+}
+
+int _sys_write(FILEHANDLE fh, const unsigned char *buf, unsigned len, int mode)
+{
+    unsigned remaining = len;
+    (void)mode;
+
+    if (((fh != UART_FH_STDOUT) && (fh != UART_FH_STDERR)) ||
+        (buf == NULL) || !uart_stdio_ready()) {
+        return (int)len;
+    }
+
+    while (remaining > 0U) {
+        uint16_t chunk = (remaining > 0xFFFFU) ? 0xFFFFU : (uint16_t)remaining;
+        if (HAL_UART_Transmit(&huart1, (uint8_t *)buf, chunk, HAL_MAX_DELAY) != HAL_OK) {
+            return (int)remaining;
+        }
+        buf += chunk;
+        remaining -= chunk;
+    }
+    return 0;
+}
+
+int _sys_read(FILEHANDLE fh, unsigned char *buf, unsigned len, int mode)
+{
+    (void)fh;
+    (void)buf;
+    (void)mode;
+    return (int)(len | 0x80000000U);
+}
+
+int _sys_istty(FILEHANDLE fh)
+{
+    return ((fh == UART_FH_STDIN) || (fh == UART_FH_STDOUT) ||
+            (fh == UART_FH_STDERR)) ? 1 : 0;
+}
+
+int _sys_seek(FILEHANDLE fh, long pos)
+{
+    (void)fh;
+    (void)pos;
+    return -1;
+}
+
+int _sys_ensure(FILEHANDLE fh)
+{
+    return ((fh == UART_FH_STDOUT) || (fh == UART_FH_STDERR)) ? 0 : -1;
+}
+
+long _sys_flen(FILEHANDLE fh)
+{
+    (void)fh;
+    return 0;
+}
+
+int _sys_tmpnam2(char *name, int sig, unsigned maxlen)
+{
+    (void)name;
+    (void)sig;
+    (void)maxlen;
+    return -1;
+}
+
+char *_sys_command_string(char *cmd, int len)
+{
+    if ((cmd != NULL) && (len > 0)) {
+        cmd[0] = '\0';
+    }
+    return cmd;
+}
+
+void _ttywrch(int ch)
+{
+    uint8_t data = (uint8_t)ch;
+    if (uart_stdio_ready()) {
+        (void)HAL_UART_Transmit(&huart1, &data, 1U, HAL_MAX_DELAY);
+    }
+}
+
+__attribute__((noreturn)) void _sys_exit(int return_code)
+{
+    (void)return_code;
+    while (1) {
+    }
+}
 
 // ---- printf retarget ----
 int fputc(int ch, FILE *f)

@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "cmsis_os.h"
 #include "i2c.h"
 #include "spi.h"
 #include "usart.h"
@@ -51,6 +52,7 @@
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
+void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
 
 /* USER CODE END PFP */
@@ -68,7 +70,14 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-
+  /*
+   * Keil Debug may configure VTOR before running to main, while a standalone
+   * hardware reset restores VTOR to its reset value.  Point it explicitly at
+   * the application vector table before HAL enables the TIM6 time-base IRQ.
+   */
+  SCB->VTOR = FLASH_BASE;
+  __DSB();
+  __ISB();
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
@@ -93,8 +102,27 @@ int main(void)
   MX_USART1_UART_Init();
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
-  scheduler_init();
+
   /* USER CODE END 2 */
+
+  /* Init scheduler */
+  if (osKernelInitialize() != osOK)  /* Call init function for freertos objects (in cmsis_os2.c) */
+  {
+    BootTrace_Fatal("osKernelInitialize failed");
+    Error_Handler();
+  }
+  MX_FREERTOS_Init();
+
+  /* Start scheduler */
+  if (osKernelStart() != osOK)
+  {
+    BootTrace_Fatal("osKernelStart failed");
+    Error_Handler();
+  }
+
+  BootTrace_Fatal("osKernelStart returned unexpectedly");
+
+  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -103,7 +131,6 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    scheduler_run();
   }
   /* USER CODE END 3 */
 }
@@ -159,6 +186,28 @@ void SystemClock_Config(void)
 /* USER CODE END 4 */
 
 /**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM6 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  /* USER CODE BEGIN Callback 0 */
+
+  /* USER CODE END Callback 0 */
+  if (htim->Instance == TIM6)
+  {
+    HAL_IncTick();
+  }
+  /* USER CODE BEGIN Callback 1 */
+
+  /* USER CODE END Callback 1 */
+}
+
+/**
   * @brief  This function is executed in case of error occurrence.
   * @retval None
   */
@@ -166,6 +215,7 @@ void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
+  BootTrace_Fatal("HAL Error_Handler");
   __disable_irq();
   while (1)
   {

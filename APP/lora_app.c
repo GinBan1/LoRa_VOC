@@ -37,6 +37,14 @@ static void lora_try_init(void)
         printf("[LoRa] Ready: status=0x%02X, freq=%lu Hz, power=%d dBm\r\n",
                status, LORA_APP_FREQUENCY_HZ, LORA_APP_TX_POWER_DBM);
         printf("[LoRa] Profile: SF7/BW125/CR4-5/private sync word\r\n");
+        result = SX1268_SleepWarm();
+        if (result != SX1268_OK)
+        {
+            lora_state = LORA_STATE_RETRY_INIT;
+            lora_next_action_ms = HAL_GetTick() + 5000U;
+            printf("[LoRa] Sleep command failed: %s\r\n",
+                   SX1268_ResultString(result));
+        }
     }
     else
     {
@@ -126,6 +134,15 @@ static void lora_handle_irq(void)
         lora_next_action_ms = HAL_GetTick() + LORA_APP_TX_PERIOD_MS;
         printf("[LoRa] Unexpected DIO1 IRQ=0x%04X\r\n", irq);
     }
+
+    result = SX1268_SleepWarm();
+    if (result != SX1268_OK)
+    {
+        lora_state = LORA_STATE_RETRY_INIT;
+        lora_next_action_ms = HAL_GetTick() + 5000U;
+        printf("[LoRa] Sleep command failed: %s\r\n",
+               SX1268_ResultString(result));
+    }
 }
 
 void Lora_App_Init(void)
@@ -162,6 +179,7 @@ void Lora_App_Task(void)
               (LORA_APP_TX_TIMEOUT_MS + 500U)))
     {
         (void)SX1268_Standby();
+        (void)SX1268_SleepWarm();
         lora_state = LORA_STATE_IDLE;
         lora_next_action_ms = now + LORA_APP_TX_PERIOD_MS;
         printf("[LoRa] Software TX timeout: check PA0/DIO1 wiring and EXTI\r\n");
@@ -176,4 +194,31 @@ void Lora_App_Dio1Irq(void)
 uint8_t Lora_App_IsReady(void)
 {
     return (lora_state != LORA_STATE_RETRY_INIT) ? 1U : 0U;
+}
+
+uint32_t Lora_App_GetNextWakeDelayMs(void)
+{
+    uint32_t now = HAL_GetTick();
+    uint32_t deadline;
+
+    if (lora_dio1_irq != 0U)
+    {
+        return 1U;
+    }
+
+    if (lora_state == LORA_STATE_TRANSMITTING)
+    {
+        deadline = lora_tx_started_ms + LORA_APP_TX_TIMEOUT_MS + 500U;
+    }
+    else
+    {
+        deadline = lora_next_action_ms;
+    }
+
+    if ((int32_t)(now - deadline) >= 0)
+    {
+        return 1U;
+    }
+
+    return deadline - now;
 }

@@ -57,6 +57,8 @@ static uint32_t g_last_ping = 0;
 volatile uint8_t OneNet_Ready = 0;
 static int g_sock = -1;
 static unsigned char g_rx_buf[RX_BUF_SIZE + 1U];
+static unsigned char g_rx_frame[RX_BUF_SIZE + 1U];
+static size_t g_rx_used;
 
 typedef enum
 {
@@ -109,6 +111,7 @@ static void onenet_close_socket(void)
 
     OneNet_Ready = 0;
     g_last_ping = 0U;
+    g_rx_used = 0U;
     g_mqtt_state = ONENET_MQTT_IDLE;
 }
 
@@ -351,22 +354,44 @@ static int socket_connect_complete(int sock)
     return (socket_error == 0) ? 1 : -1;
 }
 
-/* A partial nonblocking send cannot safely be replayed, so treat it as a
- * connection failure.  A zero result means no bytes were accepted yet. */
+/* Send one complete MQTT frame. This function is only called by the dedicated
+ * network task, so a short retry window cannot delay LoRa or OLED work. */
 static int socket_send(int sock, const unsigned char *data, int len)
 {
-    const int result = send(sock, data, len, 0);
+    int sent = 0;
+    const uint32_t deadline_ms = onenet_now_ms() + 250U;
 
-    if (result == len)
+    if (data == NULL || len <= 0)
     {
-        return result;
-    }
-    if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-    {
-        return 0;
+        return -1;
     }
 
-    return -1;
+    while (sent < len)
+    {
+        const int result = send(sock, data + sent, len - sent, 0);
+
+        if (result > 0)
+        {
+            sent += result;
+            continue;
+        }
+        if (result < 0 && errno == EINTR)
+        {
+            continue;
+        }
+        if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+        {
+            if (onenet_time_reached(onenet_now_ms(), deadline_ms))
+            {
+                return -1;
+            }
+            vTaskDelay(pdMS_TO_TICKS(1));
+            continue;
+        }
+        return -1;
+    }
+
+    return sent;
 }
 
 /* >0 bytes received, 0 no data, -2 orderly peer close, -1 socket error. */
@@ -388,6 +413,102 @@ static int socket_recv(int sock, unsigned char *buf, int len)
     }
 
     return -1;
+}
+
+/* Append currently available TCP data to the MQTT stream accumulator.
+ * MQTT is a byte stream: one recv() may contain half a packet or many packets. */
+static int onenet_receive_stream(void)
+{
+    int result;
+
+    if (g_rx_used >= RX_BUF_SIZE)
+    {
+        return -1;
+    }
+
+    result = socket_recv(g_sock,
+                         &g_rx_buf[g_rx_used],
+                         (int)(RX_BUF_SIZE - g_rx_used));
+    if (result > 0)
+    {
+        g_rx_used += (size_t)result;
+        g_rx_buf[g_rx_used] = '\0';
+    }
+    return result;
+}
+
+/* 1: a complete frame was copied, 0: more bytes are required, -1: malformed. */
+static int onenet_extract_mqtt_frame(size_t *frame_length)
+{
+    uint32_t remaining_length = 0U;
+    uint32_t multiplier = 1U;
+    size_t header_length = 1U;
+    size_t index;
+    size_t total_length;
+    uint8_t type;
+
+    if (frame_length == NULL)
+    {
+        return -1;
+    }
+    *frame_length = 0U;
+
+    if (g_rx_used < 2U)
+    {
+        return 0;
+    }
+
+    type = g_rx_buf[0] >> 4;
+    if (type < MQTT_PKT_CONNECT || type > MQTT_PKT_DISCONNECT)
+    {
+        return -1;
+    }
+
+    for (index = 1U; index <= 4U; ++index)
+    {
+        uint8_t encoded;
+
+        if (index >= g_rx_used)
+        {
+            return 0;
+        }
+
+        encoded = g_rx_buf[index];
+        remaining_length += (uint32_t)(encoded & 0x7FU) * multiplier;
+        ++header_length;
+
+        if ((encoded & 0x80U) == 0U)
+        {
+            break;
+        }
+        if (index == 4U)
+        {
+            return -1;
+        }
+        multiplier *= 128U;
+    }
+
+    if (remaining_length > (uint32_t)(RX_BUF_SIZE - header_length))
+    {
+        return -1;
+    }
+
+    total_length = header_length + (size_t)remaining_length;
+    if (g_rx_used < total_length)
+    {
+        return 0;
+    }
+
+    memcpy(g_rx_frame, g_rx_buf, total_length);
+    g_rx_frame[total_length] = '\0';
+    g_rx_used -= total_length;
+    if (g_rx_used > 0U)
+    {
+        memmove(g_rx_buf, &g_rx_buf[total_length], g_rx_used);
+    }
+    g_rx_buf[g_rx_used] = '\0';
+    *frame_length = total_length;
+    return 1;
 }
 
 //==========================================================
@@ -434,6 +555,8 @@ static void onenet_process_connection(uint32_t now_ms)
 {
     int connect_result;
     int rx_len;
+    size_t frame_length;
+    int frame_result;
 
     if (g_socket_close_pending)
     {
@@ -507,12 +630,23 @@ static void onenet_process_connection(uint32_t now_ms)
 
     if (g_mqtt_state == ONENET_MQTT_WAIT_CONNACK)
     {
-        rx_len = socket_recv(g_sock, g_rx_buf, RX_BUF_SIZE);
-        if (rx_len > 0)
+        rx_len = onenet_receive_stream();
+        if (rx_len < 0)
         {
-            g_rx_buf[rx_len] = '\0';
-            if (MQTT_UnPacketRecv(g_rx_buf) == MQTT_PKT_CONNACK &&
-                MQTT_UnPacketConnectAck(g_rx_buf) == 0)
+            onenet_schedule_mqtt_retry(now_ms, "MQTT CONNACK receive failed");
+            return;
+        }
+
+        frame_result = onenet_extract_mqtt_frame(&frame_length);
+        if (frame_result < 0)
+        {
+            onenet_schedule_mqtt_retry(now_ms, "malformed MQTT CONNACK stream");
+        }
+        else if (frame_result > 0)
+        {
+            (void)frame_length;
+            if (MQTT_UnPacketRecv(g_rx_frame) == MQTT_PKT_CONNACK &&
+                MQTT_UnPacketConnectAck(g_rx_frame) == 0)
             {
                 OneNet_Ready = 1U;
                 g_mqtt_state = ONENET_MQTT_READY;
@@ -523,10 +657,6 @@ static void onenet_process_connection(uint32_t now_ms)
                 return;
             }
             onenet_schedule_mqtt_retry(now_ms, "MQTT CONNACK rejected");
-        }
-        else if (rx_len < 0)
-        {
-            onenet_schedule_mqtt_retry(now_ms, "MQTT CONNACK receive failed");
         }
         else if (onenet_time_reached(now_ms, g_connack_deadline_ms))
         {
@@ -926,6 +1056,8 @@ void OneNet_ProcessLoop(void)
 {
     const uint32_t now_ms = onenet_now_ms();
     int rx_len;
+    int frame_result;
+    size_t frame_length;
 
     if (g_socket_close_pending || g_mqtt_state != ONENET_MQTT_READY ||
         !g_wifi_connected || !OneNet_Ready || g_sock < 0)
@@ -950,16 +1082,27 @@ void OneNet_ProcessLoop(void)
         g_last_ping = now_ms;
     }
 
-    rx_len = socket_recv(g_sock, g_rx_buf, RX_BUF_SIZE);
-    if (rx_len > 0)
-    {
-        g_rx_buf[rx_len] = '\0';
-        OneNet_RevPro(g_rx_buf);
-    }
-    else if (rx_len < 0)
+    rx_len = onenet_receive_stream();
+    if (rx_len < 0)
     {
         onenet_schedule_mqtt_retry(now_ms,
                                   (rx_len == -2) ? "broker closed connection" : "socket receive failed");
+        return;
     }
+
+    do
+    {
+        frame_result = onenet_extract_mqtt_frame(&frame_length);
+        if (frame_result < 0)
+        {
+            onenet_schedule_mqtt_retry(now_ms, "malformed MQTT stream");
+            return;
+        }
+        if (frame_result > 0)
+        {
+            (void)frame_length;
+            OneNet_RevPro(g_rx_frame);
+        }
+    } while (frame_result > 0);
 
 }

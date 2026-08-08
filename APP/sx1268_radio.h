@@ -23,6 +23,8 @@ sx1268_result_t SX1268_StartTx(const uint8_t *payload, uint8_t length,
                                uint32_t timeout_ms);
 sx1268_result_t SX1268_GetAndClearIrq(uint16_t *irq);
 sx1268_result_t SX1268_Standby(void);
+sx1268_result_t SX1268_SleepWarm(void);
+sx1268_result_t SX1268_Wakeup(void);
 void SX1268_FrontEndIdle(void);
 const char *SX1268_ResultString(sx1268_result_t result);
 

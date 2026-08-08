@@ -3,6 +3,7 @@
 #include "main.h"
 #include "spi.h"
 
+#define SX1268_CMD_SET_SLEEP                0x84U
 #define SX1268_CMD_SET_STANDBY              0x80U
 #define SX1268_CMD_SET_TX                   0x83U
 #define SX1268_CMD_SET_PACKET_TYPE          0x8AU
@@ -27,6 +28,7 @@
 
 #define SX1268_PACKET_TYPE_LORA             0x01U
 #define SX1268_STANDBY_RC                   0x00U
+#define SX1268_SLEEP_WARM_START             0x04U
 #define SX1268_REGULATOR_DCDC               0x01U
 #define SX1268_TCXO_VOLTAGE_2V2             0x03U
 #define SX1268_RAMP_200_US                   0x04U
@@ -37,6 +39,48 @@
 #define SX1268_XTAL_FREQ_HZ                 32000000ULL
 #define SX1268_BUSY_TIMEOUT_MS              100U
 #define SX1268_SPI_TIMEOUT_MS               100U
+
+static uint8_t sx1268_is_sleeping = 0U;
+
+static sx1268_result_t sx1268_wait_while_busy(uint32_t timeout_ms);
+
+sx1268_result_t SX1268_Wakeup(void)
+{
+    uint8_t tx[2] = {SX1268_CMD_GET_STATUS, 0x00U};
+    uint8_t rx[2] = {0U};
+    HAL_StatusTypeDef hal_result;
+    sx1268_result_t result;
+
+    if (sx1268_is_sleeping == 0U)
+    {
+        return SX1268_OK;
+    }
+
+    /*
+     * NSS falling edge wakes SX126x. Sending GetStatus while NSS remains low
+     * follows Semtech's reference wake-up sequence and also verifies SPI.
+     */
+    HAL_GPIO_WritePin(LoRa_CS_GPIO_Port, LoRa_CS_Pin, GPIO_PIN_RESET);
+    for (volatile uint32_t delay = 0U; delay < 2000U; delay++)
+    {
+        __NOP();
+    }
+    hal_result = HAL_SPI_TransmitReceive(&hspi1, tx, rx, 2U,
+                                         SX1268_SPI_TIMEOUT_MS);
+    HAL_GPIO_WritePin(LoRa_CS_GPIO_Port, LoRa_CS_Pin, GPIO_PIN_SET);
+
+    if (hal_result != HAL_OK)
+    {
+        return SX1268_SPI_ERROR;
+    }
+
+    result = sx1268_wait_while_busy(SX1268_BUSY_TIMEOUT_MS);
+    if (result == SX1268_OK)
+    {
+        sx1268_is_sleeping = 0U;
+    }
+    return result;
+}
 
 static sx1268_result_t sx1268_wait_while_busy(uint32_t timeout_ms)
 {
@@ -57,6 +101,12 @@ static sx1268_result_t sx1268_transfer(uint8_t *tx, uint8_t *rx, uint16_t length
 {
     sx1268_result_t result;
     HAL_StatusTypeDef hal_result;
+
+    result = SX1268_Wakeup();
+    if (result != SX1268_OK)
+    {
+        return result;
+    }
 
     result = sx1268_wait_while_busy(SX1268_BUSY_TIMEOUT_MS);
     if (result != SX1268_OK)
@@ -146,6 +196,7 @@ static sx1268_result_t sx1268_write_buffer(const uint8_t *data, uint8_t length)
 
 static void sx1268_hardware_reset(void)
 {
+    sx1268_is_sleeping = 0U;
     SX1268_FrontEndIdle();
     HAL_GPIO_WritePin(LoRa_CS_GPIO_Port, LoRa_CS_Pin, GPIO_PIN_SET);
     HAL_GPIO_WritePin(LoRa_NRST_GPIO_Port, LoRa_NRST_Pin, GPIO_PIN_RESET);
@@ -422,6 +473,25 @@ sx1268_result_t SX1268_Standby(void)
 
     result = sx1268_write_command(SX1268_CMD_SET_STANDBY, &parameter, 1U);
     SX1268_FrontEndIdle();
+    return result;
+}
+
+sx1268_result_t SX1268_SleepWarm(void)
+{
+    uint8_t parameter = SX1268_SLEEP_WARM_START;
+    sx1268_result_t result;
+
+    if (sx1268_is_sleeping != 0U)
+    {
+        return SX1268_OK;
+    }
+
+    SX1268_FrontEndIdle();
+    result = sx1268_write_command(SX1268_CMD_SET_SLEEP, &parameter, 1U);
+    if (result == SX1268_OK)
+    {
+        sx1268_is_sleeping = 1U;
+    }
     return result;
 }
 

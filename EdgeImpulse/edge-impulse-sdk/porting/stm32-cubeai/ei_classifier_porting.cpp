@@ -70,9 +70,7 @@ __attribute__((weak)) void ei_printf_float(float f) {
     float n = f;
 
     static double PRECISION = 0.00001;
-    static int MAX_NUMBER_STRING_SIZE = 32;
-
-    char s[MAX_NUMBER_STRING_SIZE];
+    char s[32];
 
     if (n == 0.0) {
         strcpy(s, "0");

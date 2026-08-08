@@ -49,6 +49,14 @@ idf.py -p COMx flash monitor
 
 将 `COMx` 换成实际串口。`sdkconfig.defaults` 只包含 ESP32、4 MB Flash 等安全基础配置，不含任何个人凭据。
 
+仓库还提供了适配本机 ESP-IDF 5.5.5 工具目录的构建辅助脚本，可直接执行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File ..\tools\build_esp32.ps1
+```
+
+其他电脑应优先使用官方 ESP-IDF 终端中的 `idf.py build`，或通过脚本参数传入实际的 `IdfPath`、`EspToolsPath` 与 `ProjectPath`。
+
 ## AQ1 遥测协议
 
 STM32 发送的 ASCII 帧格式如下，`*` 前内容采用 CRC-16/CCITT-FALSE 校验，校验值为 4 位大写十六进制：
@@ -79,3 +87,7 @@ AQ1,seq,uptime_ms,flags,temp_x10,humidity_x10,pressure_x10,sraw_voc,voc_index,ai
 | `lora_rssi` | int，-150~0 | 最近一帧 LoRa RSSI（dBm） |
 
 网络任务独立运行，Wi-Fi/MQTT 重连不会阻塞 LoRa 接收或 OLED 刷新。
+
+## 当前网络安全边界
+
+当前 OneNET 连接使用 TCP 1883，已实现异步重连、发送完整性处理以及 MQTT TCP 半包/粘包缓存，但链路本身没有 TLS 加密。它可用于本项目的原型联调；公网或长期部署前应改用 OneNET 支持的 TLS 接口、校验证书，并轮换已有设备密钥。LoRa 的 private sync word 与 CRC 同样不提供加密或发送端身份认证。

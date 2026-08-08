@@ -62,7 +62,9 @@ STM32 当前关键引脚：
 4. 用 Keil 打开 `MDK-ARM/LoRaWAN.uvprojx`，执行 Build。
 5. 连接 ST-Link，烧录并打开 USART1 串口查看启动、传感器、TinyML 和 LoRa 状态。
 
-STM32 的主要应用调度位于 `APP/scheduler.c`。正常模式下环境采样和 TinyML 以 1 Hz 运行，OLED 周期刷新，LoRa 状态机以短周期运行。数据采集模式和 LoRa 链路测试模式由对应 APP 头文件中的编译开关控制。
+STM32 的 FreeRTOS 应用入口位于 `APP/rtos_app.c`。正常模式下 `ApplicationTask` 以 1 Hz 完成环境采样、TinyML 和 OLED 刷新；较高优先级的 `LoRaTask` 由 DIO1 事件或发送截止时间唤醒，不进行忙轮询。E22 在两次 5 秒上报之间使用 warm sleep，CPU 空闲时由 FreeRTOS Idle Hook 执行 `WFI`。数据采集模式和 LoRa 链路测试模式由对应 APP 头文件中的编译开关控制。
+
+任务栈每 60 秒自动检查一次，只有低于保守阈值时才打印 `[RTOS] WARN`。当前完整 Keil 构建结果为 0 Error、0 Warning；不应仅因代码文件较多就盲目扩大任务栈。
 
 ## AQ1 LoRa 遥测协议
 
@@ -122,3 +124,11 @@ AQ1,seq,uptime_ms,flags,temp_x10,humidity_x10,pressure_x10,sraw_voc,voc_index,ai
 - LoRa private sync word 与 CRC 都不是加密。需要防伪造或保密时，应在应用层增加认证与加密，并设计重放保护。
 - 频率、发射功率、天线和占空比必须符合部署地区的无线电法规；不要在未接天线时发射。
 - 人工污染实验应使用低风险、可控气味源，保持通风，避免可燃、有毒或高浓度挥发物。
+
+## 当前完成状态与下一步
+
+当前版本已经具备：FreeRTOS 多任务、独立 LoRa 状态机、SX1268 warm sleep、AQ1 严格解析与 CRC、ESP32 断网不阻塞接收/显示、Wi-Fi/MQTT 自动重连、OneNET 真实遥测上传、两端 OLED 和 RTOS 栈余量告警。STM32 与 ESP32 均已通过完整构建。
+
+尚未完成的是需要新数据支撑的“未来 30 分钟环境趋势预测”。当前 Edge Impulse 模型只对最近 30 秒窗口做 `normal` / `warning` 状态分类，不能冒充未来预测。采集工作恢复后，应按场景隔离数据、定义明确的 30 分钟未来标签，并使用独立测试场景验证。
+
+完整硬件联调步骤见 [`docs/TEST_PLAN_CN.md`](docs/TEST_PLAN_CN.md)。
