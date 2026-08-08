@@ -37,4 +37,12 @@ config AIR_GATEWAY_ONENET_TOKEN_EXPIRY
     help
         Token 的 et 参数，填入未来的 Unix 时间戳（秒）。0 表示未配置，连接会失败。
 
+config AIR_GATEWAY_ONENET_TLS_TIMEOUT_MS
+    int "OneNET TLS 握手超时（毫秒）"
+    range 3000 30000
+    default 10000
+    help
+        MQTTS 连接和服务器证书校验的最大等待时间。TLS 在独立网络任务中执行，
+        不会阻塞 LoRa 接收、OLED 刷新或主调度任务。
+
 endmenu

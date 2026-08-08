@@ -13,11 +13,14 @@ idf_component_register(
     INCLUDE_DIRS "."
                  "Net"
                  "APP"
+    EMBED_TXTFILES "../certs/onenet_root_ca.pem"
     REQUIRES esp_driver_spi
              esp_driver_gpio
              esp_driver_i2c
              esp_timer
              esp_wifi
              esp_event
+             esp-tls
+             esp_netif
              nvs_flash
              lwip)

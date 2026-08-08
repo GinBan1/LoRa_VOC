@@ -13,5 +13,6 @@ void Lora_App_Init(void);
 void Lora_App_Task(void);
 void Lora_App_Dio1Irq(void);
 uint8_t Lora_App_IsReady(void);
+uint32_t Lora_App_GetNextWakeDelayMs(void);
 
 #endif /* LORA_APP_H */
