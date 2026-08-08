@@ -29,6 +29,7 @@ $env:IDF_PATH = $IdfPath
 $env:IDF_TOOLS_PATH = $EspToolsPath
 $env:IDF_PYTHON_ENV_PATH = $pythonEnv
 $env:IDF_TARGET = "esp32"
+$env:IDF_SKIP_CHECK_SUBMODULES = "1"
 $gitUsrBin = Join-Path $GitRoot "usr\bin"
 $gitMingwBin = Join-Path $GitRoot "mingw64\bin"
 $extraPath = @($ninjaDir, $cmakeDir, $toolchainDir, "$pythonEnv\Scripts")
