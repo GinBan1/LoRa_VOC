@@ -7,6 +7,7 @@
 
 
 #include "oled.h"
+#include "tinyml_app.h"
 
 Environment_Data_t g_env_data = {0};
 
@@ -557,11 +558,14 @@ void OLED_ShowCursor(uint8_t x, uint8_t y, uint8_t no, uint8_t Color_Turn)
 
 void my_oledprintf(uint8_t Line,char * format , ...)
 {
-	char string[17] = "                ";
+	char formatted[48] = {0};
+	char string[17];
 	va_list args;
 	va_start(args,format);
-	vsnprintf(string,16,format,args);
+	vsnprintf(formatted,sizeof(formatted),format,args);
 	va_end(args);
+	memset(string, ' ', 16);
+	strncpy(string, formatted, 16);
 	string[16] = '\0';
 
 	char *degree_ptr = strstr(string, "°C");
@@ -618,6 +622,7 @@ void oled_cnprintf(uint8_t line, const uint8_t *hz, uint8_t hz_cnt, char *format
 //==================== VOC 趋势分析器 (环形缓冲区 + 滞回防抖 + 确认计数器) ====================//
 #define BUF_SIZE 10 // 10秒环形缓冲区
 
+#if 0
 static float  trend_buf[BUF_SIZE] = {0};
 static uint8_t trend_buf_idx        = 0;
 static uint8_t trend_buf_filled     = 0;
@@ -727,5 +732,84 @@ char oled_buf[32]; // 局部显示缓冲区
 void oled_task()
 {
     // 更新显示缓冲区
+    lcd_proc();
+}
+#endif
+
+//==================== 屏幕数据更新函数 ====================//
+void lcd_proc(void)
+{
+    const tinyml_result_t *ai_result = TinyML_App_GetLatestResult();
+    uint32_t confidence = (uint32_t)(ai_result->confidence * 100.0f + 0.5f);
+
+    if (confidence > 100U)
+    {
+        confidence = 100U;
+    }
+
+    // ----------------- 1. 第一行：当前30秒TinyML识别结果 -----------------
+    switch (ai_result->state)
+    {
+        case TINYML_STATE_WARMING_UP:
+            my_oledprintf(0, "AI:WARMUP %3lus",
+                          (unsigned long)TinyML_App_GetWarmupRemainingSeconds());
+            break;
+
+        case TINYML_STATE_COLLECTING_WINDOW:
+            my_oledprintf(0, "AI:WINDOW %2lu/30",
+                          (unsigned long)TinyML_App_GetWindowSamplesCollected());
+            break;
+
+        case TINYML_STATE_NORMAL:
+            my_oledprintf(0, "AI:NORMAL   %3lu%%", (unsigned long)confidence);
+            break;
+
+        case TINYML_STATE_WARNING:
+            my_oledprintf(0, "AI:WARNING  %3lu%%", (unsigned long)confidence);
+            break;
+
+        case TINYML_STATE_UNCERTAIN:
+            my_oledprintf(0, "AI:UNCERT   %3lu%%", (unsigned long)confidence);
+            break;
+
+        case TINYML_STATE_ERROR:
+        default:
+            my_oledprintf(0, "AI:MODEL ERROR");
+            break;
+    }
+
+    // ----------------- 2. 第二行：未来5分钟模型预留 -----------------
+    // 当前模型判断的是最近30秒状态；接入5分钟预测模型后替换“--”。
+    my_oledprintf(2, "PRED 5M: --");
+
+    // ----------------- 3. 第三行：VOC数据 -----------------
+    if (g_env_data.sgp40_valid)
+    {
+        my_oledprintf(4, "VOC:%5u I:%3ld",
+                      (unsigned int)g_env_data.sgp40_raw,
+                      (long)g_env_data.voc_index);
+    }
+    else
+    {
+        my_oledprintf(4, "VOC: SENSOR ERR");
+    }
+
+    // ----------------- 4. 第四行：温湿度和气压 -----------------
+    if (g_env_data.bme680_valid)
+    {
+        my_oledprintf(6, "T%4.1f H%4.1f P%3.0f",
+                      g_env_data.temperature,
+                      g_env_data.humidity,
+                      g_env_data.pressure);
+    }
+    else
+    {
+        my_oledprintf(6, "ENV: SENSOR ERR");
+    }
+}
+
+/*------------------------------OLED显示----------------------------------------*/
+void oled_task()
+{
     lcd_proc();
 }
