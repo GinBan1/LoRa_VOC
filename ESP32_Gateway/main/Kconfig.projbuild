@@ -1,0 +1,40 @@
+menu "空气环境 LoRa 网关配置"
+
+config AIR_GATEWAY_WIFI_SSID
+    string "Wi-Fi 名称（SSID）"
+    default ""
+    help
+        网关连接路由器使用的 Wi-Fi 名称。
+
+config AIR_GATEWAY_WIFI_PASSWORD
+    string "Wi-Fi 密码"
+    default ""
+    help
+        网关连接路由器使用的 Wi-Fi 密码。不要将包含真实密码的 sdkconfig 提交到仓库。
+
+config AIR_GATEWAY_ONENET_PRODUCT_ID
+    string "OneNET 产品 ID"
+    default ""
+    help
+        OneNET 产品开发者中心中显示的产品 ID。
+
+config AIR_GATEWAY_ONENET_DEVICE_NAME
+    string "OneNET 设备名称"
+    default ""
+    help
+        OneNET 产品下已创建设备的设备名称。
+
+config AIR_GATEWAY_ONENET_ACCESS_KEY
+    string "OneNET Access Key"
+    default ""
+    help
+        仅用于在设备端生成 MQTT 登录 Token 的 Access Key。
+        请将其视为密码管理，不要写入源码或提交到仓库。
+
+config AIR_GATEWAY_ONENET_TOKEN_EXPIRY
+    int "OneNET Token 过期时间（Unix 秒）"
+    default 0
+    help
+        Token 的 et 参数，填入未来的 Unix 时间戳（秒）。0 表示未配置，连接会失败。
+
+endmenu

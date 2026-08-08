@@ -1,36 +1,78 @@
 #include "scheduler.h"
-/*结构体*/
+
+#include "app_environment.h"
+#include "data_logger.h"
+#include "lora_app.h"
+#include "main.h"
+#include "oled.h"
+#include "tinyml_app.h"
+
+#include <stdint.h>
+
 typedef struct
 {
     void (*task_func)(void);
-    uint32_t rate_ms;//运行周期
-    uint32_t last_run;//上次运行时间
-}task_t;
+    uint32_t period_ms;
+    uint32_t last_run_ms;
+} scheduler_task_t;
 
-uint8_t task_num;//发送间隔变量
-unsigned char timCount;//发送间隔变量（由TIM2中断置1）
-
-/*存储结构体和结构体名称*/
-static task_t scheduler_task[] =
+static scheduler_task_t scheduler_tasks[] =
 {
-
+#if DATA_LOGGER_COLLECTION_MODE
+    {Environment_App_Task, 1000U, 0U},
+    {DataLogger_App_Task,     10U, 0U}
+#elif LORA_APP_LINK_TEST_MODE
+    {Lora_App_Task,           5U, 0U}
+#else
+    {Environment_App_Task, 1000U, 0U},
+    {TinyML_App_Task,       1000U, 0U},
+    {oled_task,             1000U, 0U},
+    {Lora_App_Task,            5U, 0U}
+#endif
 };
 
-/*结构体初始化*/
-void scheduler_init()
+void scheduler_init(void)
 {
-    task_num = sizeof(scheduler_task) / sizeof(task_t);//数据大小/结构体大小
-}
-/*调度器运行函数*/
-void scheduler_run()
-{
-    for(uint8_t i=0;i<task_num;i++)
+    uint32_t now;
+    uint32_t i;
+    uint32_t task_count;
+
+#if DATA_LOGGER_COLLECTION_MODE
+    Environment_App_Init();
+    DataLogger_App_Init();
+#elif LORA_APP_LINK_TEST_MODE
+    Lora_App_Init();
+#else
+    Environment_App_Init();
+    TinyML_App_Init();
+    OLED_Init();
+    OLED_Clear();
+    lcd_proc();
+    Lora_App_Init();
+#endif
+
+    now = HAL_GetTick();
+    task_count = sizeof(scheduler_tasks) / sizeof(scheduler_tasks[0]);
+    for (i = 0U; i < task_count; i++)
     {
-        uint32_t now_time = HAL_GetTick();
-        if(now_time >= scheduler_task[i].rate_ms + scheduler_task[i].last_run)
+        scheduler_tasks[i].last_run_ms = now;
+    }
+}
+
+void scheduler_run(void)
+{
+    uint32_t now = HAL_GetTick();
+    uint32_t i;
+    uint32_t task_count =
+        sizeof(scheduler_tasks) / sizeof(scheduler_tasks[0]);
+
+    for (i = 0U; i < task_count; i++)
+    {
+        if ((now - scheduler_tasks[i].last_run_ms) >=
+            scheduler_tasks[i].period_ms)
         {
-            scheduler_task[i].last_run = now_time;//更新时间
-            scheduler_task[i].task_func();
+            scheduler_tasks[i].last_run_ms = now;
+            scheduler_tasks[i].task_func();
         }
     }
 }

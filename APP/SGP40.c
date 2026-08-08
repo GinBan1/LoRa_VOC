@@ -1,4 +1,5 @@
 #include "SGP40.h"
+#include "data_logger.h"
 
 GasIndexAlgorithmParams voc_params; // 定义算法结构体
 
@@ -48,7 +49,9 @@ uint16_t SGP40_Read_RawData(float bme_temp, float bme_hum)
     // 发送命令
     if (HAL_I2C_Master_Transmit(&hi2c1, SGP40_I2C_ADDR, cmd, 8, 200) != HAL_OK)
     {
+#if !DATA_LOGGER_COLLECTION_MODE
 		 printf("发送读取命令失败\n");
+#endif
          return 0;//发送失败
     }
     HAL_Delay(50); // 等待传感器测量，手册规定大于30ms，多留余量
@@ -70,13 +73,17 @@ uint16_t SGP40_Read_RawData(float bme_temp, float bme_hum)
 		else
         {
             // 如果走到这里，说明通信成了，但是返回的数据CRC不对，说明总线有毛刺波形变形
+#if !DATA_LOGGER_COLLECTION_MODE
             printf("【通信成功但校验失败】收到数据: 0x%02X 0x%02X, 它的CRC是: 0x%02X, 传感器期望的CRC是: 0x%02X\n",
                    rx_buf[0], rx_buf[1], SGP40_checkCRC(rx_buf), rx_buf[2]);
+#endif
         }
     }
 	else
     {
+#if !DATA_LOGGER_COLLECTION_MODE
         printf("【硬件报错】命令发成了，但是读取 3 字节回包时超时拒接！\n");
+#endif
     }
     return 0;//读取失败或CRC校验失败
 }

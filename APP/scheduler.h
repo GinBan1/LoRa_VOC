@@ -1,10 +1,7 @@
-#ifndef __SCHEDULER_H__
-#define __SCHEDULER_H__
+#ifndef SCHEDULER_H
+#define SCHEDULER_H
 
-#include "bsp.h"
-#include "stdio.h"
+void scheduler_init(void);
+void scheduler_run(void);
 
-void scheduler_init();
-void scheduler_run();
-
-#endif
+#endif /* SCHEDULER_H */
