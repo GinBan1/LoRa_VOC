@@ -14,7 +14,7 @@ static int cJSON_strcasecmp(const char *s1,const char *s2)
 {
     if (!s1) return (s1==s2)?0:1;
     if (!s2) return 1;
-    for(; tolower(*s1) == tolower(*s2); ++s1, ++s2)    if(*s1 == 0)    return 0;
+    for(; tolower((unsigned char)*s1) == tolower((unsigned char)*s2); ++s1, ++s2)    if(*s1 == 0)    return 0;
     return tolower(*(const unsigned char *)s1) - tolower(*(const unsigned char *)s2);
 }
 
@@ -84,7 +84,11 @@ static const char *parse_number(cJSON *item,const char *num)
     n=sign*n*pow(10.0,(scale+subscale*signsubscale));    /* number = +/- number.fraction * 10^+/- exponent */
 
     item->valuedouble=n;
-    item->valueint=(int)n;
+    /* JSON numbers may exceed int range; a direct floating cast is undefined. */
+    if (isnan(n)) item->valueint=0;
+    else if (n >= INT_MAX) item->valueint=INT_MAX;
+    else if (n <= INT_MIN) item->valueint=INT_MIN;
+    else item->valueint=(int)n;
     item->type=cJSON_Number;
     return num;
 }

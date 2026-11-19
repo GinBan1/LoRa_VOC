@@ -1,19 +1,16 @@
 #ifndef DATA_LOGGER_H
 #define DATA_LOGGER_H
 
-/*
- * Set this to 1 while collecting TinyML training data.
- *
- * Collection mode runs only the environment sensor task and this logger.
- * LoRa and TinyML inference remain in the project, but are not scheduled, so
- * their diagnostic output cannot corrupt the captured CSV stream.
- */
+/* 置 1 启用历史数据采集模式，仅运行传感器和 CSV 日志任务。 */
 #ifndef DATA_LOGGER_COLLECTION_MODE
 #define DATA_LOGGER_COLLECTION_MODE 0U
 #endif
 
+#define DATA_LOGGER_SCHEMA_VERSION   2U
 #define DATA_LOGGER_WARMUP_MS       60000U
 #define DATA_LOGGER_SAMPLE_PERIOD_MS 1000U
+#define DATA_LOGGER_STATUS_PERIOD_MS 300000U
+#define DATA_LOGGER_MIN_SESSION_MS  3900000U
 
 void DataLogger_App_Init(void);
 void DataLogger_App_Task(void);

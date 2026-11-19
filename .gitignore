@@ -1,85 +1,30 @@
-# ============================================
-# STM32 / Keil MDK-ARM Build Outputs
-# ============================================
+# STM32 工程与外部 SDK
+/STM32Cube_FW_F4_V1.28.3/
 /MDK-ARM/LoRaWAN/
 *.uvguix.*
 *.uvoptx
-.mxproject
 *.axf
 *.elf
 *.hex
 *.bin
 *.map
-*.lst
-*.lnp
-*.dep
-*.d
 *.o
 *.obj
-*.crf
-*.htm
-*.log
-JLinkLog.txt
 
-# ============================================
-# ESP-IDF Generated Files
-# Keep sdkconfig.defaults and all source files.
-# ============================================
+# ESP32 构建产物和本机网络配置
 **/build/
-**/CMakeFiles/
 **/managed_components/
 **/sdkconfig
 **/sdkconfig.old
-**/dependencies.lock
 
-# ============================================
-# Local Runtime Data / Reports
-# ============================================
-/Serial Debug *.txt
-/serial*.txt
-/serial*.log
+# 监视器记录和本机文件
 /outputs/
-
-# ============================================
-# ML Raw / Generated Datasets
-# Keep scripts, documentation and EdgeImpulse model source.
-# ============================================
-/ML/raw_sessions/*.csv
-/ML/edge_impulse_warning_state_v2/training/*.csv
-/ML/edge_impulse_warning_state_v2/testing/*.csv
-/ML/edge_impulse_warning_state_v2/processed_sources/*.csv
-/ML/edge_impulse_warning_state_v2/manifest.csv
-/ML/edge_impulse_warning_state_v2/source_summary.csv
-/ML/archive/legacy_regression_data/*.csv
-
-# ============================================
-# Claude / AI
-# ============================================
-.claude/
-/.omc/
-
-# ============================================
-# Editor / IDE
-# ============================================
+*.csv
+*.log
+.env
+.env.*
 .vscode/
 .idea/
-*.swp
-*.swo
-*~
-
-# ============================================
-# OS Generated
-# ============================================
-Thumbs.db
-.DS_Store
-Desktop.ini
-
-# ============================================
-# Python
-# ============================================
 __pycache__/
 *.pyc
-*.pyo
-.env
-venv/
 .venv/

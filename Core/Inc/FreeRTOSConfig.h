@@ -167,7 +167,19 @@ standard names. */
 #define USE_CUSTOM_SYSTICK_HANDLER_IMPLEMENTATION 0
 
 /* USER CODE BEGIN Defines */
-/* Section where parameter definitions can be added (for instance, to override default ones in FreeRTOS.h) */
+/* 启用后使用应用层 RTC 停拍，不调用移植层的 SysTick 停拍实现。 */
+#ifndef APP_STOP_ENABLE
+#define APP_STOP_ENABLE 0
+#endif
+#if APP_STOP_ENABLE != 0 && APP_STOP_ENABLE != 1
+#error APP_STOP_ENABLE_must_be_0_or_1
+#endif
+#if APP_STOP_ENABLE
+void app_stop_sleep(uint32_t expected_ticks);
+#define configUSE_TICKLESS_IDLE 2
+#define configEXPECTED_IDLE_TIME_BEFORE_SLEEP 2
+#define portSUPPRESS_TICKS_AND_SLEEP(ticks) app_stop_sleep((uint32_t)(ticks))
+#endif
 /* USER CODE END Defines */
 
 #endif /* FREERTOS_CONFIG_H */

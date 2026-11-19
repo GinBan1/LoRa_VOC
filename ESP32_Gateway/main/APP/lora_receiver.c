@@ -1,5 +1,6 @@
 #include "lora_receiver.h"
 
+#include <stdio.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -57,6 +58,9 @@ static void save_packet(const sx1268_rx_packet_t *packet)
 
     if (parse_result == TELEMETRY_PARSE_OK)
     {
+        /* 原样输出通过校验的 AQ2 扩展帧，供电脑读取。 */
+        if (telemetry.live_ai_present)
+            printf("%.*s\n", (int)packet->length, (const char *)packet->data);
         ESP_LOGI(TAG,
                  "RX #%lu valid #%lu seq=%lu, RSSI=%d dBm, SNR=%.1f dB",
                  (unsigned long)packet_count,

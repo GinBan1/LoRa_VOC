@@ -4,14 +4,11 @@
 #include <string.h>
 #include <stdint.h>
 #include <rt_sys.h>
+#include "run_logger.h"
 
-/*
- * The project uses the full Arm C library (not MicroLib).  Without a complete
- * _sys_* retarget layer the library falls back to semihosting and executes
- * BKPT 0xAB before main(), which only works while a debugger is attached.
- */
+/* 完整 Arm C 库需重定向 _sys_*；否则脱离调试器开机会触发半主机断点。 */
 #if defined(__ARMCC_VERSION)
-/* ArmClang 6: retaining a reference enables the library's link-time guard. */
+/* 保留禁用半主机符号，供链接器检查。 */
 __attribute__((used)) static void (*const no_semihosting_guard)(void) =
     __use_no_semihosting;
 #endif
@@ -24,11 +21,13 @@ const char __stdin_name[]  = ":STDIN";
 const char __stdout_name[] = ":STDOUT";
 const char __stderr_name[] = ":STDERR";
 
+#if !RUN_LOGGER_ACTIVE
 static int uart_stdio_ready(void)
 {
     return (huart1.Instance == USART1) &&
            (huart1.gState != HAL_UART_STATE_RESET);
 }
+#endif
 
 FILEHANDLE _sys_open(const char *name, int openmode)
 {
@@ -57,6 +56,11 @@ int _sys_close(FILEHANDLE fh)
 
 int _sys_write(FILEHANDLE fh, const unsigned char *buf, unsigned len, int mode)
 {
+#if RUN_LOGGER_ACTIVE
+    /* RUN 帧走独立发送函数，不经 stdio。 */
+    (void)fh; (void)buf; (void)len; (void)mode;
+    return 0;
+#else
     unsigned remaining = len;
     (void)mode;
 
@@ -74,6 +78,7 @@ int _sys_write(FILEHANDLE fh, const unsigned char *buf, unsigned len, int mode)
         remaining -= chunk;
     }
     return 0;
+#endif
 }
 
 int _sys_read(FILEHANDLE fh, unsigned char *buf, unsigned len, int mode)
@@ -126,10 +131,14 @@ char *_sys_command_string(char *cmd, int len)
 
 void _ttywrch(int ch)
 {
+#if RUN_LOGGER_ACTIVE
+    (void)ch;
+#else
     uint8_t data = (uint8_t)ch;
     if (uart_stdio_ready()) {
         (void)HAL_UART_Transmit(&huart1, &data, 1U, HAL_MAX_DELAY);
     }
+#endif
 }
 
 __attribute__((noreturn)) void _sys_exit(int return_code)
@@ -139,17 +148,19 @@ __attribute__((noreturn)) void _sys_exit(int return_code)
     }
 }
 
-// ---- printf retarget ----
+/* 重定向 printf。 */
 int fputc(int ch, FILE *f)
 {
     (void)f;
+#if !RUN_LOGGER_ACTIVE
     HAL_UART_Transmit(&huart1, (uint8_t *)&ch, 1, HAL_MAX_DELAY);
+#endif
     return ch;
 }
 
-// ---- C++ runtime stubs for MicroLib ----
+/* MicroLib 所需的 C++ 运行库兼容接口。 */
 
-// atexit (static destructor registration)
+/* 登记静态对象析构函数。 */
 typedef void (*destructor_fn)(void *);
 static destructor_fn _dtor_fn;
 static void *_dtor_arg;
@@ -162,7 +173,7 @@ int __aeabi_atexit(void *arg, void (*destructor)(void *), void *dso_handle)
     return 0;
 }
 
-// atexit internals (MicroLib missing)
+/* 保存退出回调。 */
 static void (*_atexit_fns[32])(void);
 static int _atexit_count = 0;
 
@@ -178,14 +189,14 @@ int atexit(void (*fn)(void))
 void _atexit_init(void) {}
 void *_atexit_mutex = 0;
 
-// assert
+/* 断言处理。 */
 void __aeabi_assert(const char *expr, const char *file, int line)
 {
     (void)expr; (void)file; (void)line;
     while (1) {}
 }
 
-// Wide character stubs (not used by TFLM, but referenced by micro_string.cpp)
+/* micro_string.cpp 依赖的宽字符接口。 */
 #include <wchar.h>
 size_t wcslen(const wchar_t *s) { const wchar_t *p = s; while (*p) p++; return p - s; }
 wchar_t *wmemchr(const wchar_t *s, wchar_t c, size_t n) { for (size_t i = 0; i < n; i++) if (s[i] == c) return (wchar_t *)&s[i]; return 0; }

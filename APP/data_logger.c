@@ -1,5 +1,6 @@
 #include "data_logger.h"
 
+#include "app_environment.h"
 #include "main.h"
 #include "oled.h"
 #include "usart.h"
@@ -21,6 +22,10 @@ static uint32_t data_logger_session_start_ms;
 static uint32_t data_logger_next_sample_ms;
 static uint32_t data_logger_session_id;
 static uint32_t data_logger_event_id;
+static uint32_t data_logger_emitted_samples;
+static uint32_t data_logger_missed_samples;
+static uint32_t data_logger_last_environment_sequence;
+static uint32_t data_logger_last_status_ms;
 static uint8_t data_logger_recording;
 static data_logger_state_t data_logger_state;
 
@@ -43,28 +48,61 @@ static const char *data_logger_state_name(data_logger_state_t state)
 static void data_logger_print_help(void)
 {
     printf("#COMMAND,S=start P=source_placed R=source_removed "
-           "C=clean E=end H=help\r\n");
+           "C=clean M=manual_marker T=status E=end H=help\r\n");
 }
 
 static void data_logger_emit_event(uint32_t now, const char *event_name)
 {
     uint32_t elapsed_ms = now - data_logger_session_start_ms;
+    uint32_t sensor_ms = Environment_App_GetLastSampleMs();
+    uint32_t sensor_sequence = Environment_App_GetSampleSequence();
+    uint32_t sensor_age_ms = now - sensor_ms;
+    uint32_t sample_index =
+        data_logger_next_sample_ms / DATA_LOGGER_SAMPLE_PERIOD_MS;
 
-    printf("EVENT,%lu,%lu,%lu,%lu,%s,%s,,,,,,,\r\n",
+    printf("EVENT,%lu,%lu,%lu,%lu,%lu,%lu,,,%lu,%lu,,%lu,%lu,%s,%s"
+           ",,,,,,,\r\n",
+           (unsigned long)DATA_LOGGER_SCHEMA_VERSION,
            (unsigned long)data_logger_session_id,
+           (unsigned long)sample_index,
            (unsigned long)elapsed_ms,
            (unsigned long)now,
+           (unsigned long)elapsed_ms,
+           (unsigned long)sensor_sequence,
+           (unsigned long)sensor_age_ms,
+           (unsigned long)data_logger_missed_samples,
            (unsigned long)data_logger_event_id,
            data_logger_state_name(data_logger_state),
            event_name);
 }
 
-static void data_logger_emit_data(uint32_t sample_ms, uint32_t now)
+static uint32_t data_logger_emit_data(uint32_t sample_ms,
+                                      uint32_t now,
+                                      uint32_t sample_index)
 {
-    printf("DATA,%lu,%lu,%lu,%lu,%s,,%.2f,%.2f,%.2f,%u,%ld,%u,%u\r\n",
+    uint32_t actual_elapsed_ms = now - data_logger_session_start_ms;
+    uint32_t scheduled_uptime_ms = data_logger_session_start_ms + sample_ms;
+    uint32_t sensor_ms = Environment_App_GetLastSampleMs();
+    uint32_t sensor_sequence = Environment_App_GetSampleSequence();
+    uint32_t sensor_age_ms = now - sensor_ms;
+    uint32_t sensor_fresh =
+        (sensor_sequence != data_logger_last_environment_sequence) ? 1U : 0U;
+    int32_t timing_error_ms = (int32_t)(actual_elapsed_ms - sample_ms);
+
+    printf("DATA,%lu,%lu,%lu,%lu,%lu,%lu,%lu,%ld,%lu,%lu,%lu,%lu,%lu,%s,,"
+           "%.2f,%.2f,%.2f,%u,%ld,%u,%u\r\n",
+           (unsigned long)DATA_LOGGER_SCHEMA_VERSION,
            (unsigned long)data_logger_session_id,
+           (unsigned long)sample_index,
            (unsigned long)sample_ms,
            (unsigned long)now,
+           (unsigned long)actual_elapsed_ms,
+           (unsigned long)scheduled_uptime_ms,
+           (long)timing_error_ms,
+           (unsigned long)sensor_sequence,
+           (unsigned long)sensor_age_ms,
+           (unsigned long)sensor_fresh,
+           (unsigned long)data_logger_missed_samples,
            (unsigned long)data_logger_event_id,
            data_logger_state_name(data_logger_state),
            g_env_data.temperature,
@@ -74,6 +112,24 @@ static void data_logger_emit_data(uint32_t sample_ms, uint32_t now)
            (long)g_env_data.voc_index,
            (unsigned int)g_env_data.bme680_valid,
            (unsigned int)g_env_data.sgp40_valid);
+
+    data_logger_emitted_samples++;
+    data_logger_last_environment_sequence = sensor_sequence;
+    return sensor_fresh;
+}
+
+static void data_logger_emit_status(uint32_t now)
+{
+    uint32_t elapsed_ms = now - data_logger_session_start_ms;
+
+    printf("#STATUS,recording=%u,session_id=%lu,elapsed_ms=%lu,"
+           "samples=%lu,missed=%lu,state=%s\r\n",
+           (unsigned int)data_logger_recording,
+           (unsigned long)data_logger_session_id,
+           (unsigned long)(data_logger_recording ? elapsed_ms : 0U),
+           (unsigned long)data_logger_emitted_samples,
+           (unsigned long)data_logger_missed_samples,
+           data_logger_state_name(data_logger_state));
 }
 
 static void data_logger_start_session(uint32_t now)
@@ -91,11 +147,16 @@ static void data_logger_start_session(uint32_t now)
     data_logger_session_start_ms = now;
     data_logger_next_sample_ms = 0U;
     data_logger_event_id = 0U;
+    data_logger_emitted_samples = 0U;
+    data_logger_missed_samples = 0U;
+    /* 预热结束后允许第一条新采样入表。 */
+    data_logger_last_environment_sequence = 0U;
+    data_logger_last_status_ms = now;
     data_logger_state = DATA_LOGGER_STATE_CLEAN;
     data_logger_recording = 1U;
 
     data_logger_emit_event(now, "session_start");
-    data_logger_emit_data(0U, now);
+    (void)data_logger_emit_data(0U, now, 0U);
     data_logger_next_sample_ms = DATA_LOGGER_SAMPLE_PERIOD_MS;
 }
 
@@ -133,6 +194,7 @@ static void data_logger_handle_command(uint8_t command, uint32_t now)
         case 'r':
             if (data_logger_recording != 0U)
             {
+                data_logger_event_id++;
                 data_logger_state = DATA_LOGGER_STATE_RECOVERY;
                 data_logger_emit_event(now, "source_removed");
             }
@@ -146,6 +208,7 @@ static void data_logger_handle_command(uint8_t command, uint32_t now)
         case 'c':
             if (data_logger_recording != 0U)
             {
+                data_logger_event_id++;
                 data_logger_state = DATA_LOGGER_STATE_CLEAN;
                 data_logger_emit_event(now, "clean_confirmed");
             }
@@ -155,11 +218,36 @@ static void data_logger_handle_command(uint8_t command, uint32_t now)
             }
             break;
 
+        case 'M':
+        case 'm':
+            if (data_logger_recording != 0U)
+            {
+                data_logger_event_id++;
+                data_logger_emit_event(now, "manual_marker");
+            }
+            else
+            {
+                printf("#WARN,press_S_first\r\n");
+            }
+            break;
+
+        case 'T':
+        case 't':
+            data_logger_emit_status(now);
+            break;
+
         case 'E':
         case 'e':
             if (data_logger_recording != 0U)
             {
+                data_logger_event_id++;
                 data_logger_emit_event(now, "session_end");
+                if ((now - data_logger_session_start_ms) <
+                    DATA_LOGGER_MIN_SESSION_MS)
+                {
+                    printf("#WARN,session_shorter_than_recommended_ms=%lu\r\n",
+                           (unsigned long)DATA_LOGGER_MIN_SESSION_MS);
+                }
                 data_logger_recording = 0U;
                 printf("#LOGGER,session_saved_in_terminal_capture\r\n");
             }
@@ -189,11 +277,7 @@ static void data_logger_poll_uart(uint32_t now)
     uint8_t command;
     uint32_t reads;
 
-    /*
-     * USART1 is configured as TX/RX by CubeMX. A zero-timeout poll keeps the
-     * cooperative scheduler non-blocking and avoids adding an IRQ/DMA path
-     * solely for occasional one-character event markers.
-     */
+    /* 零超时读取单字符事件标记，不阻塞采集任务。 */
     for (reads = 0U; reads < 8U; reads++)
     {
         if (HAL_UART_Receive(&huart1, &command, 1U, 0U) != HAL_OK)
@@ -212,22 +296,33 @@ void DataLogger_App_Init(void)
     data_logger_next_sample_ms = 0U;
     data_logger_session_id = 0U;
     data_logger_event_id = 0U;
+    data_logger_emitted_samples = 0U;
+    data_logger_missed_samples = 0U;
+    data_logger_last_environment_sequence = 0U;
+    data_logger_last_status_ms = data_logger_boot_ms;
     data_logger_recording = 0U;
     data_logger_state = DATA_LOGGER_STATE_CLEAN;
 
-    printf("#LOGGER,ready,warmup_ms=%lu,sample_period_ms=%lu\r\n",
+    printf("#LOGGER,ready,schema=%lu,warmup_ms=%lu,sample_period_ms=%lu,"
+           "min_session_ms=%lu\r\n",
+           (unsigned long)DATA_LOGGER_SCHEMA_VERSION,
            (unsigned long)DATA_LOGGER_WARMUP_MS,
-           (unsigned long)DATA_LOGGER_SAMPLE_PERIOD_MS);
+           (unsigned long)DATA_LOGGER_SAMPLE_PERIOD_MS,
+           (unsigned long)DATA_LOGGER_MIN_SESSION_MS);
     data_logger_print_help();
-    printf("record_type,session_id,timestamp_ms,uptime_ms,event_id,"
-           "event_state,event_name,temperature,humidity,pressure,sraw_voc,"
-           "voc_index,bme680_valid,sgp40_valid\r\n");
+    printf("record_type,schema_version,session_id,sample_index,timestamp_ms,"
+           "uptime_ms,actual_elapsed_ms,scheduled_uptime_ms,timing_error_ms,"
+           "sensor_sequence,sensor_age_ms,sensor_fresh,missed_samples_total,"
+           "event_id,event_state,event_name,temperature,humidity,pressure,"
+           "sraw_voc,voc_index,bme680_valid,sgp40_valid\r\n");
 }
 
 void DataLogger_App_Task(void)
 {
     uint32_t now = HAL_GetTick();
     uint32_t elapsed_ms;
+    uint32_t late_slots;
+    uint32_t sample_index;
 
     data_logger_poll_uart(now);
 
@@ -237,25 +332,39 @@ void DataLogger_App_Task(void)
     }
 
     elapsed_ms = now - data_logger_session_start_ms;
+
+    if ((now - data_logger_last_status_ms) >= DATA_LOGGER_STATUS_PERIOD_MS)
+    {
+        data_logger_emit_status(now);
+        data_logger_last_status_ms = now;
+    }
+
     if (elapsed_ms < data_logger_next_sample_ms)
     {
         return;
     }
 
-    if ((elapsed_ms - data_logger_next_sample_ms) >=
-        DATA_LOGGER_SAMPLE_PERIOD_MS)
+    late_slots = (elapsed_ms - data_logger_next_sample_ms) /
+                 DATA_LOGGER_SAMPLE_PERIOD_MS;
+    if (late_slots > 0U)
     {
-        /*
-         * A long blocking operation caused at least one missed sample.
-         * Keep the real gap visible instead of fabricating duplicate values.
-         */
-        printf("#WARN,sample_gap_ms=%lu\r\n",
-               (unsigned long)(elapsed_ms - data_logger_next_sample_ms));
-        data_logger_next_sample_ms =
-            (elapsed_ms / DATA_LOGGER_SAMPLE_PERIOD_MS) *
-            DATA_LOGGER_SAMPLE_PERIOD_MS;
+        /* 有漏采就保留时间缺口，不复制上一条数据。 */
+        data_logger_missed_samples += late_slots;
+        data_logger_next_sample_ms +=
+            late_slots * DATA_LOGGER_SAMPLE_PERIOD_MS;
+        printf("#WARN,missed_samples=%lu,total_missed=%lu\r\n",
+               (unsigned long)late_slots,
+               (unsigned long)data_logger_missed_samples);
     }
 
-    data_logger_emit_data(data_logger_next_sample_ms, now);
+    sample_index = data_logger_next_sample_ms /
+                   DATA_LOGGER_SAMPLE_PERIOD_MS;
+    if (data_logger_emit_data(data_logger_next_sample_ms,
+                              now,
+                              sample_index) == 0U)
+    {
+        printf("#WARN,stale_sensor_sample,index=%lu\r\n",
+               (unsigned long)sample_index);
+    }
     data_logger_next_sample_ms += DATA_LOGGER_SAMPLE_PERIOD_MS;
 }

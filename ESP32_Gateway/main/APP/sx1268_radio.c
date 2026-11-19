@@ -225,11 +225,11 @@ static esp_err_t configure_radio(void)
     p[0] = 0x00U; /* STDBY_RC */
     TRY(write_command(CMD_SET_STANDBY, p, 1U));
 
-    /* E22-400M22S: DIO3 supplies the on-board 32 MHz TCXO at 2.2 V. */
+    /* E22-400M22S 的 32 MHz TCXO 由 DIO3 提供 2.2 V。 */
     p[0] = 0x03U;
     p[1] = 0x00U;
     p[2] = 0x02U;
-    p[3] = 0x80U; /* 10 ms */
+    p[3] = 0x80U; /* 等待 10 ms。 */
     TRY(write_command(CMD_SET_DIO3_TCXO_CTRL, p, 4U));
 
     p[0] = 0x01U; /* DCDC */
@@ -238,14 +238,14 @@ static esp_err_t configure_radio(void)
     p[0] = 0x7FU;
     TRY(write_command(CMD_CALIBRATE, p, 1U));
     p[0] = 0x75U;
-    p[1] = 0x81U; /* 470-510 MHz image calibration */
+    p[1] = 0x81U; /* 470–510 MHz 镜像校准。 */
     TRY(write_command(CMD_CALIBRATE_IMAGE, p, 2U));
 
-    p[0] = 0x01U; /* LoRa packet type */
+    p[0] = 0x01U; /* 选择 LoRa 包类型。 */
     TRY(write_command(CMD_SET_PACKET_TYPE, p, 1U));
     TRY(set_rf_frequency(SX1268_FREQUENCY_HZ));
 
-    /* SF7 / BW125 kHz / CR4-5 / LDRO off. */
+    /* SF7、带宽 125 kHz、编码率 4/5，不开 LDRO。 */
     p[0] = 0x07U;
     p[1] = 0x04U;
     p[2] = 0x01U;
@@ -257,13 +257,13 @@ static esp_err_t configure_radio(void)
     TRY(write_command(CMD_SET_BUFFER_BASE_ADDRESS, p, 2U));
     TRY(write_register(SX1268_SYNC_WORD_ADDRESS, sync_word, sizeof(sync_word)));
 
-    /* The E22 exposes TXEN/RXEN, so internal DIO2 RF-switch control is off. */
+    /* 用 E22 的 TXEN/RXEN 控制射频开关，不由 DIO2 控制。 */
     p[0] = 0x00U;
     TRY(write_command(CMD_SET_DIO2_RF_SWITCH, p, 1U));
-    p[0] = 0x20U; /* fallback to STDBY_RC */
+    p[0] = 0x20U; /* 操作后返回 STDBY_RC。 */
     TRY(write_command(CMD_SET_FALLBACK_MODE, p, 1U));
 
-    /* Preamble 8, explicit header, max 255 bytes, CRC on, normal IQ. */
+    /* 8 符号前导码，显式头，最多 255 字节，启用 CRC，IQ 不翻转。 */
     p[0] = 0x00U;
     p[1] = 0x08U;
     p[2] = 0x00U;
@@ -275,7 +275,7 @@ static esp_err_t configure_radio(void)
     p[0] = (uint8_t)(IRQ_RX_MASK >> 8);
     p[1] = (uint8_t)IRQ_RX_MASK;
     p[2] = p[0];
-    p[3] = p[1]; /* route RX events to DIO1 */
+    p[3] = p[1]; /* 接收中断映射到 DIO1。 */
     p[4] = 0x00U;
     p[5] = 0x00U;
     p[6] = 0x00U;
@@ -358,7 +358,7 @@ esp_err_t sx1268_radio_init(uint8_t *status)
 
 esp_err_t sx1268_radio_start_receive(void)
 {
-    uint8_t timeout[3] = {0xFFU, 0xFFU, 0xFFU}; /* continuous receive */
+    uint8_t timeout[3] = {0xFFU, 0xFFU, 0xFFU}; /* 连续接收。 */
 
     if (!s_initialized && (s_spi == NULL))
     {
@@ -422,7 +422,7 @@ esp_err_t sx1268_radio_poll(sx1268_rx_packet_t *packet, bool *packet_ready)
     }
     *packet_ready = false;
 
-    /* DIO1 remains asserted until the routed IRQ is cleared. */
+    /* 清除对应中断后，DIO1 才会撤销。 */
     if (gpio_get_level(LORA_PIN_DIO1) == 0)
     {
         return ESP_OK;

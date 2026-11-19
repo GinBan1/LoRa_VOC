@@ -4,12 +4,20 @@ idf_component_register(
          "Net/cJSON.c"
          "Net/hmac_sha1.c"
          "Net/MQTT.c"
+         "Net/json_guard.c"
          "Net/onenet.c"
+         "Net/mail.c"
+         "Net/mail_test.c"
+         "Net/smtp_client.c"
          "APP/sx1268_radio.c"
          "APP/telemetry_protocol.c"
          "APP/lora_receiver.c"
          "APP/oled_display.c"
+         "APP/oled_dashboard.c"
          "APP/scheduler.c"
+         "APP/alarm.c"
+         "APP/alarm_app.c"
+         "APP/boot_diag.c"
     INCLUDE_DIRS "."
                  "Net"
                  "APP"
@@ -22,5 +30,6 @@ idf_component_register(
              esp_event
              esp-tls
              esp_netif
+             mbedtls
              nvs_flash
              lwip)

@@ -1,7 +1,16 @@
 #include "SGP40.h"
+#include "bsp.h"
 #include "data_logger.h"
+#include "app_power_profile.h"
+#include <stddef.h>
 
 GasIndexAlgorithmParams voc_params; // 定义算法结构体
+static uint32_t voc_init_count;
+static uint32_t voc_init_ms;
+static uint32_t voc_process_count;
+
+// SGP40 measure_raw_signal；0x2612 是 SGP41 conditioning，不能混用。
+#define SGP40_CMD_MEASURE_RAW_SIGNAL 0x260FU
 
 // 盛思锐官方的 CRC8 校验算法 (多项式: 0x31, 初始值: 0xFF)
 uint8_t SGP40_checkCRC(uint8_t *data)
@@ -23,7 +32,9 @@ uint8_t SGP40_checkCRC(uint8_t *data)
 // 读取原始数据
 uint16_t SGP40_Read_RawData(float bme_temp, float bme_hum)
 {
-    uint8_t cmd[8] = {0x26, 0x12, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // 读取原始数据的命令，动态传入BME680温湿度
+    uint8_t cmd[8] = {(uint8_t)(SGP40_CMD_MEASURE_RAW_SIGNAL >> 8),
+                      (uint8_t)(SGP40_CMD_MEASURE_RAW_SIGNAL & 0xFFU),
+                      0x00, 0x00, 0x00, 0x00, 0x00, 0x00}; // 动态传入BME680温湿度
     uint8_t rx_buf[3] = {0}; // 接收缓冲区，包含2字节原始数据和1字节CRC校验
     uint16_t raw_data = 0;
 	//将 BME680 的浮点数转化为 SGP40 需要的格式
@@ -54,7 +65,7 @@ uint16_t SGP40_Read_RawData(float bme_temp, float bme_hum)
 #endif
          return 0;//发送失败
     }
-    HAL_Delay(50); // 等待传感器测量，手册规定大于30ms，多留余量
+    pwr_wait_ms(50U); /* 等待测量完成，保留 50 ms 裕量。 */
     // 如果I2C外设不在READY状态，先等它就绪再读
     uint32_t timeout = HAL_GetTick() + 100;
     while(hi2c1.State != HAL_I2C_STATE_READY)
@@ -90,4 +101,33 @@ uint16_t SGP40_Read_RawData(float bme_temp, float bme_hum)
 void GasIndexAlgorithmParams_Init(void)
 {
     GasIndexAlgorithm_init(&voc_params, GasIndexAlgorithm_ALGORITHM_TYPE_VOC); // 初始化算法参数
+    ++voc_init_count;
+    voc_init_ms = HAL_GetTick();
+    voc_process_count = 0U;
+}
+
+uint8_t SGP40_ProcessVOC(uint16_t raw, int32_t *voc_index)
+{
+    if ((raw == 0U) || (voc_index == NULL)) return 0U;
+    GasIndexAlgorithm_process(&voc_params, (int32_t)raw, voc_index);
+    ++voc_process_count;
+    return 1U;
+}
+
+void SGP40_GetSnapshot(SGP40_VOCSnapshot_t *snapshot)
+{
+    if (snapshot == NULL) return;
+    snapshot->init_count = voc_init_count;
+    snapshot->init_ms = voc_init_ms;
+    snapshot->process_count = voc_process_count;
+    snapshot->estimator_initialized = voc_params.m_Mean_Variance_Estimator___Initialized ? 1U : 0U;
+    snapshot->mean = voc_params.m_Mean_Variance_Estimator___Mean +
+                     voc_params.m_Mean_Variance_Estimator___Sraw_Offset;
+    snapshot->std = voc_params.m_Mean_Variance_Estimator___Std;
+    snapshot->estimator_uptime_gamma_s = voc_params.m_Mean_Variance_Estimator___Uptime_Gamma;
+}
+
+const char *SGP40_GetAlgorithmVersion(void)
+{
+    return LIBRARY_VERSION_NAME;
 }

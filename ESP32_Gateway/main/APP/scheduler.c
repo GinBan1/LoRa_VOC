@@ -32,7 +32,7 @@ void scheduler_init(void)
         s_tasks[i].last_run = now_ms;
     }
 
-    /* LoRa uses a dedicated task so a network receive cannot delay radio RX. */
+    /* 无线接收独立运行，不等待网络。 */
     error = lora_receiver_init();
     if (error != ESP_OK)
     {

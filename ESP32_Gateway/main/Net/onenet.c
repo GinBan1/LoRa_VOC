@@ -1,4 +1,3 @@
-//ESP-IDF
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -11,21 +10,18 @@
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
 
-//协议文件
 #include "onenet.h"
 #include "MQTT.h"
 
-//算法
 #include "base64.h"
 #include "hmac_sha1.h"
 
-//C库
 #include <string.h>
 #include <stdio.h>
-#include <string.h>
 #include <time.h>
 
 #include "cJSON.h"
+#include "json_guard.h"
 #include "lora_receiver.h"
 #include "sdkconfig.h"
 
@@ -40,12 +36,7 @@
 #define TAG                      "OneNET"
 #define MQTT_PORT                8883
 #define MQTT_HOST                "mqttstls.heclouds.com"
-/*
- * OneNET MQTTS uses an official self-signed server certificate whose
- * Subject/CN is "OneNET MQTTS" rather than the access hostname. ESP-TLS
- * still verifies the embedded CA/certificate and this exact name; do not
- * set skip_common_name to true.
- */
+/* OneNET 证书名称与接入域名不同；仍校验证书和下列名称。 */
 #define MQTT_SERVER_CERT_NAME    "OneNET MQTTS"
 
 #define RX_BUF_SIZE              1024
@@ -55,13 +46,10 @@
 #define ONENET_SNTP_RETRY_MS      30000U
 #define ONENET_MIN_VALID_UNIX_TIME 1704067200LL /* 2024-01-01 00:00:00 UTC */
 
-// MQTT 心跳间隔（秒），OneNET 要求不大于300s
+/* 心跳间隔不超过 300 秒。 */
 #define MQTT_KEEPALIVE_SEC        240
 static uint32_t g_last_ping = 0;
 
-/*---------------------------------------------------------------------------*/
-/* 全局变量                                                                   */
-/*---------------------------------------------------------------------------*/
 volatile uint8_t OneNet_Ready = 0;
 static esp_tls_t *g_tls;
 static unsigned char g_rx_buf[RX_BUF_SIZE + 1U];
@@ -90,7 +78,7 @@ static uint32_t g_sntp_retry_due_ms;
 static bool g_sntp_initialized;
 static onenet_mqtt_state_t g_mqtt_state = ONENET_MQTT_IDLE;
 
-/* CMake embeds the official OneNET root certificate as a NUL-terminated PEM. */
+/* CMake 内嵌的 OneNET PEM 证书以 NUL 结尾。 */
 extern const uint8_t onenet_root_ca_pem_start[] asm("_binary_onenet_root_ca_pem_start");
 extern const uint8_t onenet_root_ca_pem_end[] asm("_binary_onenet_root_ca_pem_end");
 
@@ -99,7 +87,7 @@ static uint32_t onenet_now_ms(void)
     return (uint32_t)(esp_timer_get_time() / 1000);
 }
 
-/* Signed subtraction keeps all due-time checks correct across uint32_t wrap. */
+/* 用有符号差值处理毫秒计数回绕。 */
 static bool onenet_time_reached(uint32_t now_ms, uint32_t due_ms)
 {
     return (int32_t)(now_ms - due_ms) >= 0;
@@ -140,10 +128,6 @@ static void onenet_schedule_mqtt_retry(uint32_t now_ms, const char *reason)
              (unsigned long)(g_mqtt_retry_due_ms - now_ms));
 }
 
-// 用于WiFi连接的FreeRTOS事件组
-/*---------------------------------------------------------------------------*/
-/* WiFi 事件处理                                                               */
-/*---------------------------------------------------------------------------*/
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data)
 {
@@ -184,9 +168,8 @@ static void wifi_init_sta(char *ssid, char *password)
 
     if (wifi_inited)
     {
-        // WiFi 已初始化，直接等待重连
         ESP_LOGI(TAG, "Waiting for WiFi reconnect...");
-        /* Reconnect attempts are driven asynchronously by the network task. */
+        /* 重连交给网络任务处理。 */
         return;
     }
 
@@ -212,17 +195,11 @@ static void wifi_init_sta(char *ssid, char *password)
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
+    /* 不等待入网；IP 由回调通知。 */
     ESP_LOGI(TAG, "WiFi Init Done, Connecting...");
-
-    // 等待连接成功
-    /* Do not wait here: the event handler reports the eventual IP address. */
 }
 
-/*===========================================================================*/
-/* Token生成                                                                   */
-/*===========================================================================*/
-
-// URL 编码表（不编码数字和字母，其余按百分比编码）
+/* URL 只保留字母、数字和 ._~-，其余字节转为百分号编码。 */
 static char *url_encode_buf(char *buf_out, int out_len, char *buf_in)
 {
     int j = 0;
@@ -275,7 +252,6 @@ static void OneNET_GenToken(char *token, unsigned short token_len)
     BASE64_Encode((unsigned char *)sign_buf, sizeof(sign_buf), &olen,
                   (unsigned char *)hmac_sha1_buf, 20);    // SHA1 固定 20 字节
 
-    // 对 sign 做 URL 编码
     memset(sign_enc, 0, sizeof(sign_enc));
     url_encode_buf(sign_enc, sizeof(sign_enc), sign_buf);
 
@@ -284,10 +260,7 @@ static void OneNET_GenToken(char *token, unsigned short token_len)
              PROID, DEVICE_NAME, ET, METHOD, sign_enc);
 }
 
-/*===========================================================================*/
-/* Socket TCP 通信（替代ESP8266 AT指令）                                        */
-/*===========================================================================*/
-/* Establish and verify TLS in the dedicated network task. */
+/* 在网络任务中连接并校验 TLS。 */
 static int onenet_tls_connect(void)
 {
     const esp_tls_cfg_t tls_cfg = {
@@ -295,14 +268,12 @@ static int onenet_tls_connect(void)
         .cacert_bytes = (unsigned int)(onenet_root_ca_pem_end - onenet_root_ca_pem_start),
         .common_name = MQTT_SERVER_CERT_NAME,
         .skip_common_name = false,
-        /* Keep read/write non-blocking after the verified handshake. */
+        /* 握手后保留非阻塞读写。 */
         .non_block = true,
         .timeout_ms = (int)ONENET_TLS_TIMEOUT_MS,
         .tls_version = ESP_TLS_VER_TLS_1_2,
     };
 
-    /* This bounded call only runs in onenet_network_task, never in the Wi-Fi
-     * event callback or the LoRa/OLED scheduler tasks. */
     return esp_tls_conn_new_sync(MQTT_HOST, (int)strlen(MQTT_HOST),
                                  MQTT_PORT, &tls_cfg, g_tls);
 }
@@ -315,9 +286,7 @@ static bool onenet_clock_is_valid(void)
     return (int64_t)now >= ONENET_MIN_VALID_UNIX_TIME;
 }
 
-/* TLS certificate validation needs a real clock.  SNTP is started and
- * retried asynchronously from the dedicated network task; no event callback
- * waits for time synchronization. */
+/* 异步校时，供 TLS 检查证书有效期。 */
 static bool onenet_ensure_time_synced(uint32_t now_ms)
 {
     esp_err_t result;
@@ -359,8 +328,7 @@ static bool onenet_ensure_time_synced(uint32_t now_ms)
     return false;
 }
 
-/* Send one complete MQTT frame. This function is only called by the dedicated
- * network task, so a short retry window cannot delay LoRa or OLED work. */
+/* 在网络任务中发完一帧 MQTT，允许短暂重试。 */
 static int tls_send(const unsigned char *data, int len)
 {
     int sent = 0;
@@ -396,7 +364,7 @@ static int tls_send(const unsigned char *data, int len)
     return sent;
 }
 
-/* >0 bytes received, 0 no data, -2 orderly peer close, -1 socket error. */
+/* 正数为收到的字节数，0 无数据，-2 对端关闭，-1 错误。 */
 static int tls_recv(unsigned char *buf, int len)
 {
     const int result = (g_tls != NULL) ?
@@ -418,8 +386,7 @@ static int tls_recv(unsigned char *buf, int len)
     return -1;
 }
 
-/* Append available TLS payload data to the MQTT stream accumulator.
- * MQTT is a byte stream: one read() may contain half a packet or many packets. */
+/* 缓存 TLS 下发数据；单次读取不一定恰好是一帧 MQTT。 */
 static int onenet_receive_stream(void)
 {
     int result;
@@ -439,92 +406,30 @@ static int onenet_receive_stream(void)
     return result;
 }
 
-/* 1: a complete frame was copied, 0: more bytes are required, -1: malformed. */
+/* 取出一帧：1 成功，0 需继续接收，-1 帧格式错误。 */
 static int onenet_extract_mqtt_frame(size_t *frame_length)
 {
-    uint32_t remaining_length = 0U;
-    uint32_t multiplier = 1U;
-    size_t header_length = 1U;
-    size_t index;
-    size_t total_length;
-    uint8_t type;
+    size_t total_length = 0U;
+    int32 result;
 
-    if (frame_length == NULL)
-    {
-        return -1;
-    }
+    if (frame_length == NULL) return -1;
     *frame_length = 0U;
-
-    if (g_rx_used < 2U)
-    {
-        return 0;
-    }
-
-    type = g_rx_buf[0] >> 4;
-    if (type < MQTT_PKT_CONNECT || type > MQTT_PKT_DISCONNECT)
-    {
-        return -1;
-    }
-
-    for (index = 1U; index <= 4U; ++index)
-    {
-        uint8_t encoded;
-
-        if (index >= g_rx_used)
-        {
-            return 0;
-        }
-
-        encoded = g_rx_buf[index];
-        remaining_length += (uint32_t)(encoded & 0x7FU) * multiplier;
-        ++header_length;
-
-        if ((encoded & 0x80U) == 0U)
-        {
-            break;
-        }
-        if (index == 4U)
-        {
-            return -1;
-        }
-        multiplier *= 128U;
-    }
-
-    if (remaining_length > (uint32_t)(RX_BUF_SIZE - header_length))
-    {
-        return -1;
-    }
-
-    total_length = header_length + (size_t)remaining_length;
-    if (g_rx_used < total_length)
-    {
-        return 0;
-    }
+    result = MQTT_FrameLength(g_rx_buf, g_rx_used, &total_length);
+    if (result < 0 || total_length > RX_BUF_SIZE) return -1;
+    if (result == 0) return 0;
+    if (MQTT_UnPacketRecvLength(g_rx_buf, total_length) == 255U) return -1;
 
     memcpy(g_rx_frame, g_rx_buf, total_length);
     g_rx_frame[total_length] = '\0';
     g_rx_used -= total_length;
     if (g_rx_used > 0U)
-    {
         memmove(g_rx_buf, &g_rx_buf[total_length], g_rx_used);
-    }
     g_rx_buf[g_rx_used] = '\0';
     *frame_length = total_length;
     return 1;
 }
 
-//==========================================================
-//    函数名称：    OneNet_DevLink
-//
-//    函数功能：    与onenet创建连接
-//
-//    入口参数：    wifi_ssid：WiFi名称
-//                wifi_password：WiFi密码
-//
-//    返回参数：    1-成功    0-失败
-//
-//    说明：        先连WiFi再连MQTT Broker
-//==========================================================
+/* 发起 OneNET 的 MQTT 登录。 */
 static bool onenet_send_connect_request(uint32_t now_ms)
 {
     MQTT_PACKET_STRUCTURE mqtt_packet = {NULL, 0, 0, 0};
@@ -640,9 +545,8 @@ static void onenet_process_connection(uint32_t now_ms)
         }
         else if (frame_result > 0)
         {
-            (void)frame_length;
-            if (MQTT_UnPacketRecv(g_rx_frame) == MQTT_PKT_CONNACK &&
-                MQTT_UnPacketConnectAck(g_rx_frame) == 0)
+            if (MQTT_UnPacketRecvLength(g_rx_frame, frame_length) == MQTT_PKT_CONNACK &&
+                MQTT_UnPacketConnectAckLength(g_rx_frame, frame_length) == 0)
             {
                 OneNet_Ready = 1U;
                 g_mqtt_state = ONENET_MQTT_READY;
@@ -670,8 +574,7 @@ static void onenet_network_task(void *arg)
     {
         OneNet_ProcessLoop();
 
-        /* Upload only from this task.  This keeps socket ownership out of
-         * the scheduler and preserves the sequence watermark across reconnects. */
+        /* 上传由网络任务负责，重连不重置已发帧序号。 */
         if ((uint32_t)(onenet_now_ms() - last_upload_ms) >= 5000U)
         {
             last_upload_ms = onenet_now_ms();
@@ -687,6 +590,11 @@ void OneNet_Init(const char *wifi_ssid, const char *wifi_password)
 
     if (g_network_initialized || wifi_ssid == NULL || wifi_password == NULL)
     {
+        return;
+    }
+    if (wifi_ssid[0] == '\0')
+    {
+        ESP_LOGI(TAG, "Wi-Fi not configured; local LoRa mode");
         return;
     }
 
@@ -708,12 +616,10 @@ void OneNet_Init(const char *wifi_ssid, const char *wifi_password)
         return;
     }
 
-    /* wifi_init_sta() performs the one-time ESP-IDF setup but no longer waits. */
     wifi_init_sta(g_wifi_ssid, g_wifi_password);
     g_network_initialized = true;
     g_mqtt_retry_due_ms = onenet_now_ms();
 
-    /* TLS handshake and certificate parsing run only in this network task. */
     if (xTaskCreate(onenet_network_task, "onenet_net", 8192U, NULL, 4U, NULL) != pdPASS)
     {
         ESP_LOGE(TAG, "Failed to create OneNET network task");
@@ -725,17 +631,20 @@ void OneNet_SendData(void)
 {
     static bool has_uploaded_sequence = false;
     static uint32_t last_uploaded_sequence = 0U;
+    static uint32_t last_uploaded_uptime = 0U;
+    static uint8_t last_uploaded_protocol = 0U;
     lora_receiver_snapshot_t snapshot;
     MQTT_PACKET_STRUCTURE mqtt_packet = {NULL, 0, 0, 0};
     char json[384];
     float temperature;
     float humidity;
     float pressure;
-    float warning_score;
+    float up_score;
     uint16_t voc_index;
     uint8_t ai_state;
     int16_t lora_rssi;
     bool ai_valid;
+    bool event_packet;
     int json_length;
     int send_result;
 
@@ -753,7 +662,9 @@ void OneNet_SendData(void)
     }
 
     if (has_uploaded_sequence &&
-        snapshot.telemetry.sequence == last_uploaded_sequence)
+        snapshot.telemetry.sequence == last_uploaded_sequence &&
+        snapshot.telemetry.uptime_ms == last_uploaded_uptime &&
+        snapshot.telemetry.protocol_version == last_uploaded_protocol)
     {
         return;
     }
@@ -761,19 +672,22 @@ void OneNet_SendData(void)
     temperature = (float)snapshot.telemetry.temperature_x10 / 10.0f;
     humidity = (float)snapshot.telemetry.humidity_x10 / 10.0f;
     pressure = (float)snapshot.telemetry.pressure_x10 / 10.0f;
-    warning_score = (float)snapshot.telemetry.warning_x1000 / 1000.0f;
+    /* 仅旧 AQ1 使用 warning_score 和 ai_state 表示预测分数与方向。 */
+    up_score = (float)snapshot.telemetry.warning_x1000 / 1000.0f;
     voc_index = snapshot.telemetry.voc_index;
     ai_state = snapshot.telemetry.ai_state;
     lora_rssi = snapshot.rssi_dbm;
-    ai_valid = (snapshot.telemetry.flags & TELEMETRY_FLAG_AI_VALID) != 0U;
+    event_packet = snapshot.telemetry.protocol_version == 2U;
+    /* AQ2 的第 2 位表示事件就绪，而非预测分数有效。 */
+    ai_valid = !event_packet && (snapshot.telemetry.flags & TELEMETRY_FLAG_AI_VALID) != 0U;
 
-    /* Validate every value against the configured OneNET thing model. */
+    /* 上传前按 OneNET 物模型检查字段范围。 */
     if (temperature < 0.0f || temperature > 50.0f ||
         humidity < 0.0f || humidity > 100.0f ||
         pressure < 300.0f || pressure > 1100.0f ||
-        voc_index > 500U || ai_state > 5U ||
+        voc_index > 500U || (!event_packet && ai_state > 5U) ||
         lora_rssi < -150 || lora_rssi > 0 ||
-        (ai_valid && (warning_score < 0.0f || warning_score > 1.0f)))
+        (ai_valid && (up_score < 0.0f || up_score > 1.0f)))
     {
         ESP_LOGW(TAG,
                  "Skip seq=%lu: telemetry is outside OneNET model range",
@@ -781,7 +695,17 @@ void OneNet_SendData(void)
         return;
     }
 
-    if (ai_valid)
+    if (event_packet)
+    {
+        /* OneNET 未登记 AQ2 事件字段，仅上传环境数据。 */
+        json_length = snprintf(
+            json, sizeof(json),
+            "{\"id\":\"%lu\",\"version\":\"1.0\",\"params\":{\"Temp\":{\"value\":%.1f},\"humidity\":{\"value\":%.1f},\"pressure\":{\"value\":%.1f},\"voc_index\":{\"value\":%u},\"lora_rssi\":{\"value\":%d}}}",
+            (unsigned long)snapshot.telemetry.sequence,
+            (double)temperature, (double)humidity, (double)pressure,
+            (unsigned int)voc_index, (int)lora_rssi);
+    }
+    else if (ai_valid)
     {
         json_length = snprintf(
             json,
@@ -793,7 +717,7 @@ void OneNet_SendData(void)
             (double)pressure,
             (unsigned int)voc_index,
             (unsigned int)ai_state,
-            (double)warning_score,
+            (double)up_score,
             (int)lora_rssi);
     }
     else
@@ -852,7 +776,18 @@ void OneNet_SendData(void)
     }
 
     last_uploaded_sequence = snapshot.telemetry.sequence;
+    last_uploaded_uptime = snapshot.telemetry.uptime_ms;
+    last_uploaded_protocol = snapshot.telemetry.protocol_version;
     has_uploaded_sequence = true;
+    if (event_packet)
+    {
+        ESP_LOGI(TAG, "Uploaded AQ2 environment seq=%lu; event state=%u ready=%u episode=%lu (local only)",
+                 (unsigned long)snapshot.telemetry.sequence,
+                 (unsigned)snapshot.telemetry.event_state,
+                 (unsigned)((snapshot.telemetry.flags & TELEMETRY_FLAG_EVENT_READY) != 0U),
+                 (unsigned long)snapshot.telemetry.event_episode_id);
+        return;
+    }
     ESP_LOGI(TAG,
              "Uploaded seq=%lu: T=%.1f H=%.1f P=%.1f VOC=%u AI=%u Score=%s RSSI=%d",
              (unsigned long)snapshot.telemetry.sequence,
@@ -865,18 +800,7 @@ void OneNet_SendData(void)
              (int)lora_rssi);
 }
 
-//==========================================================
-//    函数名称：    OneNET_Publish
-//
-//    函数功能：    发布消息
-//
-//    入口参数：    topic：发布的主题
-//                msg：消息内容
-//
-//    返回参数：    无
-//
-//    说明：
-//==========================================================
+/* 向指定主题发布消息。 */
 void OneNET_Publish(const char *topic, const char *msg)
 {
     MQTT_PACKET_STRUCTURE mqtt_packet = {NULL, 0, 0, 0};
@@ -897,17 +821,7 @@ void OneNET_Publish(const char *topic, const char *msg)
     }
 }
 
-//==========================================================
-//    函数名称：    OneNET_Subscribe
-//
-//    函数功能：    订阅属性设置下发
-//
-//    入口参数：    无
-//
-//    返回参数：    无
-//
-//    说明：
-//==========================================================
+/* 订阅属性设置消息。 */
 void OneNET_Subscribe(void)
 {
     MQTT_PACKET_STRUCTURE mqtt_packet = {NULL, 0, 0, 0};
@@ -931,44 +845,35 @@ void OneNET_Subscribe(void)
     }
 }
 
-//==========================================================
-//    函数名称：    OneNet_RevPro
-//
-//    函数功能：    平台返回数据检测
-//
-//    入口参数：    cmd：平台返回的数据
-//
-//    返回参数：    无
-//
-//    说明：        与原STM32 onenet.c 保持一致的逻辑
-//==========================================================
-void OneNet_RevPro(unsigned char *cmd)
+/* 处理一帧完整的平台消息。 */
+void OneNet_RevProFrame(const unsigned char *cmd, size_t frame_length)
 {
     char *req_payload = NULL;
     char *cmdid_topic = NULL;
 
     char reply_topic[128];
     char reply_msg[128];
+    char reply_id[96];
 
     unsigned short topic_len = 0;
     unsigned short req_len = 0;
 
     unsigned char qos = 0;
-    static unsigned short pkt_id = 0;
+    unsigned short pkt_id = 0;
 
     unsigned char type = 0;
 
-    short result = 0;
+    uint8 result;
 
     cJSON *raw_json, *params_json;
 
-    type = MQTT_UnPacketRecv(cmd);
+    type = MQTT_UnPacketRecvLength(cmd, frame_length);
     switch (type)
     {
         case MQTT_PKT_PUBLISH:
-            result = MQTT_UnPacketPublish(cmd, &cmdid_topic, &topic_len,
-                                          &req_payload, &req_len, &qos, &pkt_id);
-            if (result == 0)
+            result = MQTT_UnPacketPublishLength(cmd, frame_length, &cmdid_topic, &topic_len,
+                                               &req_payload, &req_len, &qos, &pkt_id);
+            if (result == 0 && Json_GuardValid(req_payload, req_len))
             {
                 raw_json = cJSON_Parse(req_payload);
                 if (raw_json)
@@ -982,15 +887,16 @@ void OneNet_RevPro(unsigned char *cmd)
                     cJSON *id_json = cJSON_GetObjectItem(raw_json, "id");
                     const char *request_id = (id_json && (id_json->type == cJSON_String) &&
                                               id_json->valuestring) ? id_json->valuestring : "";
-                    int topic_len = snprintf(reply_topic, sizeof(reply_topic),
+                    bool id_valid = Json_EscapeString(request_id, reply_id, sizeof(reply_id));
+                    int reply_topic_len = snprintf(reply_topic, sizeof(reply_topic),
                                              "$sys/%s/%s/thing/property/set_reply",
                                              PROID, DEVICE_NAME);
                     int message_len = snprintf(reply_msg, sizeof(reply_msg),
                                                "{\"id\":\"%s\",\"code\":200,\"msg\":\"success\"}",
-                                               request_id);
+                                               reply_id);
 
                     cJSON_Delete(raw_json);
-                    if ((topic_len > 0) && ((size_t)topic_len < sizeof(reply_topic)) &&
+                    if (id_valid && (reply_topic_len > 0) && ((size_t)reply_topic_len < sizeof(reply_topic)) &&
                         (message_len > 0) && ((size_t)message_len < sizeof(reply_msg)))
                     {
                         OneNET_Publish(reply_topic, reply_msg);
@@ -1004,39 +910,24 @@ void OneNet_RevPro(unsigned char *cmd)
             break;
 
         case MQTT_PKT_PUBACK:
-            (void)MQTT_UnPacketPublishAck(cmd);
+            (void)MQTT_UnPacketPublishAckLength(cmd, frame_length);
             break;
 
         case MQTT_PKT_SUBACK:
-            if (MQTT_UnPacketSubscribe(cmd) != 0)
+            if (MQTT_UnPacketSubscribeLength(cmd, frame_length) != 0)
                 ESP_LOGW(TAG, "OneNET command subscription was rejected");
             break;
 
         default:
-            result = -1;
             break;
     }
 
-    if (result == -1) return;
-
-    if (type == MQTT_PKT_CMD || type == MQTT_PKT_PUBLISH)
-    {
-        MQTT_FreeBuffer(cmdid_topic);
-        MQTT_FreeBuffer(req_payload);
-    }
+    /* 解包失败时指针已清空。 */
+    MQTT_FreeBuffer(cmdid_topic);
+    MQTT_FreeBuffer(req_payload);
 }
 
-//==========================================================
-//    函数名称：    OneNet_ProcessLoop
-//
-//    函数功能：    非阻塞轮询MQTT数据（替代ESP8266 DMA空闲中断）
-//
-//    入口参数：    无
-//
-//    返回参数：    无
-//
-//    说明：        需在主循环中定期调用，例如每100ms
-//==========================================================
+/* 在网络任务中轮询 MQTT 数据和重连状态。 */
 void OneNet_ProcessLoop(void)
 {
     const uint32_t now_ms = onenet_now_ms();
@@ -1085,8 +976,7 @@ void OneNet_ProcessLoop(void)
         }
         if (frame_result > 0)
         {
-            (void)frame_length;
-            OneNet_RevPro(g_rx_frame);
+            OneNet_RevProFrame(g_rx_frame, frame_length);
         }
     } while (frame_result > 0);
 

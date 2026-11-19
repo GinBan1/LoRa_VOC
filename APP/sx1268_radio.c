@@ -56,10 +56,7 @@ sx1268_result_t SX1268_Wakeup(void)
         return SX1268_OK;
     }
 
-    /*
-     * NSS falling edge wakes SX126x. Sending GetStatus while NSS remains low
-     * follows Semtech's reference wake-up sequence and also verifies SPI.
-     */
+    /* 拉低 NSS 唤醒 SX126x，保持低电平发送 GetStatus 验证 SPI。 */
     HAL_GPIO_WritePin(LoRa_CS_GPIO_Port, LoRa_CS_Pin, GPIO_PIN_RESET);
     for (volatile uint32_t delay = 0U; delay < 2000U; delay++)
     {
@@ -122,6 +119,12 @@ static sx1268_result_t sx1268_transfer(uint8_t *tx, uint8_t *rx, uint16_t length
     if (hal_result != HAL_OK)
     {
         return SX1268_SPI_ERROR;
+    }
+
+    /* 休眠时 BUSY 保持高电平，唤醒不等待 BUSY。 */
+    if (tx[0] == SX1268_CMD_SET_SLEEP)
+    {
+        return SX1268_OK;
     }
 
     return sx1268_wait_while_busy(SX1268_BUSY_TIMEOUT_MS);
@@ -231,10 +234,7 @@ static sx1268_result_t sx1268_configure_lora(uint32_t frequency_hz,
     result = sx1268_write_command(SX1268_CMD_SET_STANDBY, parameters, 1U);
     if (result != SX1268_OK) return result;
 
-    /*
-     * E22-400M22S uses the SX1268 DIO3 pin to power its on-board 32 MHz TCXO.
-     * 10 ms / 15.625 us = 640 = 0x000280.
-     */
+    /* E22-400M22S 由 DIO3 供电给 32 MHz TCXO；10 ms 对应 640 个计时单位。 */
     parameters[0] = SX1268_TCXO_VOLTAGE_2V2;
     parameters[1] = 0x00U;
     parameters[2] = 0x02U;
@@ -250,7 +250,7 @@ static sx1268_result_t sx1268_configure_lora(uint32_t frequency_hz,
     result = sx1268_write_command(SX1268_CMD_CALIBRATE, parameters, 1U);
     if (result != SX1268_OK) return result;
 
-    /* Semtech calibration values for the 470-510 MHz band. */
+    /* 470～510 MHz 频段的 Semtech 校准参数。 */
     parameters[0] = 0x75U;
     parameters[1] = 0x81U;
     result = sx1268_write_command(SX1268_CMD_CALIBRATE_IMAGE, parameters, 2U);
@@ -263,10 +263,7 @@ static sx1268_result_t sx1268_configure_lora(uint32_t frequency_hz,
     result = sx1268_set_rf_frequency(frequency_hz);
     if (result != SX1268_OK) return result;
 
-    /*
-     * SX1268 PA setup for <= +14 dBm. Start at +10 dBm for a bench test.
-     * paDutyCycle=2, hpMax=2, deviceSel=0 (SX1268), paLut=1.
-     */
+    /* SX1268 的 ≤ +14 dBm 功放配置；本工程默认 +10 dBm。 */
     parameters[0] = 0x02U;
     parameters[1] = 0x02U;
     parameters[2] = 0x00U;
@@ -279,10 +276,7 @@ static sx1268_result_t sx1268_configure_lora(uint32_t frequency_hz,
     result = sx1268_write_command(SX1268_CMD_SET_TX_PARAMS, parameters, 2U);
     if (result != SX1268_OK) return result;
 
-    /*
-     * SF7, BW125 kHz, CR 4/5, low-data-rate optimization off.
-     * This is a short-range bench-test profile.
-     */
+    /* SF7、125 kHz 带宽、4/5 编码率，不启用低数据率优化。 */
     parameters[0] = 0x07U;
     parameters[1] = 0x04U;
     parameters[2] = 0x01U;
@@ -301,7 +295,7 @@ static sx1268_result_t sx1268_configure_lora(uint32_t frequency_hz,
     result = sx1268_write_register(SX1268_SYNC_WORD_ADDRESS, sync_word, 2U);
     if (result != SX1268_OK) return result;
 
-    /* E22 exposes TXEN/RXEN, so DIO2 RF-switch control stays disabled. */
+    /* E22 使用独立 TXEN/RXEN，关闭 DIO2 射频开关控制。 */
     parameters[0] = 0x00U;
     result = sx1268_write_command(SX1268_CMD_SET_DIO2_RF_SWITCH,
                                   parameters, 1U);
@@ -312,7 +306,7 @@ static sx1268_result_t sx1268_configure_lora(uint32_t frequency_hz,
                                   parameters, 1U);
     if (result != SX1268_OK) return result;
 
-    /* Route TX_DONE and TIMEOUT to DIO1. */
+    /* 将发射完成与超时中断映射到 DIO1。 */
     parameters[0] = 0x02U;
     parameters[1] = 0x01U;
     parameters[2] = 0x02U;
@@ -403,7 +397,7 @@ sx1268_result_t SX1268_StartTx(const uint8_t *payload, uint8_t length,
     result = sx1268_write_buffer(payload, length);
     if (result != SX1268_OK) return result;
 
-    /* Preamble=8, variable header, payload length, CRC on, normal IQ. */
+    /* 8 符号前导码、显式包头、启用 CRC、正常 IQ。 */
     parameters[0] = 0x00U;
     parameters[1] = 0x08U;
     parameters[2] = 0x00U;
@@ -423,7 +417,7 @@ sx1268_result_t SX1268_StartTx(const uint8_t *payload, uint8_t length,
     HAL_GPIO_WritePin(LoRa_RXEN_GPIO_Port, LoRa_RXEN_Pin, GPIO_PIN_RESET);
     HAL_GPIO_WritePin(LoRa_TXEN_GPIO_Port, LoRa_TXEN_Pin, GPIO_PIN_SET);
 
-    /* SX126x SetTx timeout unit is 15.625 us (64 ticks per ms). */
+    /* SetTx 超时单位为 15.625 µs，每毫秒 64 个计时单位。 */
     radio_timeout = timeout_ms * 64UL;
     if (radio_timeout > 0xFFFFFFUL)
     {
@@ -491,6 +485,8 @@ sx1268_result_t SX1268_SleepWarm(void)
     if (result == SX1268_OK)
     {
         sx1268_is_sleeping = 1U;
+        /* 等待模块保存暖启动配置后再返回。 */
+        HAL_Delay(2U);
     }
     return result;
 }

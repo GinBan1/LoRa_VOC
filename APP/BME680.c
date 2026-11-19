@@ -1,4 +1,5 @@
 #include "BME680.h"
+#include "app_power_profile.h"
 
 struct bme68x_dev bme_dev;
 uint8_t dev_addr = (0x76 << 1); // BME680 的 8位写地址 (SDO接地)
@@ -26,7 +27,7 @@ void bme68x_delay_us(uint32_t period, void *intf_ptr)
 {
     // 将微秒转为毫秒，向上取整确保延时足够
     uint32_t delay_ms = (period / 1000) + 1; 
-    HAL_Delay(delay_ms);
+    pwr_wait_ms(delay_ms);
 }
 
 // 4. 初始化函数

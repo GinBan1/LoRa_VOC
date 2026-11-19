@@ -45,4 +45,99 @@ config AIR_GATEWAY_ONENET_TLS_TIMEOUT_MS
         MQTTS 连接和服务器证书校验的最大等待时间。TLS 在独立网络任务中执行，
         不会阻塞 LoRa 接收、OLED 刷新或主调度任务。
 
+menu "环境告警"
+
+config AIR_GATEWAY_ALARM_ENABLE
+    bool "启用 VOC 事件告警"
+    default y
+    help
+        跟随节点通过 AQ2 上报的固定规则状态，不二次判断。邮件另行启用。
+
+if AIR_GATEWAY_ALARM_ENABLE
+
+menu "旧版告警兼容参数（不改变 AQ2 节点判定）"
+
+config AIR_GATEWAY_ALARM_VOC_ENTER
+    int "VOC Index 告警阈值"
+    range 2 500
+    default 200
+    help
+        VOC Index 告警的可配置触发阈值。
+
+config AIR_GATEWAY_ALARM_VOC_CLEAR
+    int "VOC Index 恢复阈值（必须小于告警阈值）"
+    range 1 499
+    default 150
+
+config AIR_GATEWAY_ALARM_UP_ENTER
+    int "上升预测告警分数（千分制）"
+    range 501 1000
+    default 800
+
+config AIR_GATEWAY_ALARM_UP_CLEAR
+    int "上升预测恢复分数（千分制，必须小于告警分数）"
+    range 500 999
+    default 600
+    help
+        有效 DOWN 且置信度达到此值，或有效 UP 的上升分数降至此值，才确认恢复。
+        低置信度或不确定状态不作为恢复。
+
+config AIR_GATEWAY_ALARM_CONFIDENCE_MIN
+    int "上升预测最低置信度（千分制）"
+    range 500 1000
+    default 800
+
+config AIR_GATEWAY_ALARM_HOLD_SECONDS
+    int "触发和恢复的连续确认时间（秒）"
+    range 1 3600
+    default 60
+    help
+        只使用新鲜的新遥测帧。连续一分钟不代表获得两次独立模型预测。
+
+config AIR_GATEWAY_ALARM_COOLDOWN_SECONDS
+    int "同类告警再次触发的最短间隔（秒）"
+    range 0 86400
+    default 1800
+    help
+        两种告警独立限流；恢复后仍满足再次触发条件时等待冷却结束。
+
+endmenu
+
+config AIR_GATEWAY_MAIL_ENABLE
+    bool "启用 QQ 邮箱通知（会向配置的收件人实际发送邮件）"
+    default n
+    select MBEDTLS_CERTIFICATE_BUNDLE
+    help
+        使用 smtp.qq.com:465 的隐式 TLS，必须验证服务器证书。
+        默认关闭；填妥本机发件邮箱、授权码和收件邮箱后才会启动邮件任务。
+
+if AIR_GATEWAY_MAIL_ENABLE
+
+config AIR_GATEWAY_MAIL_TEST_CONSOLE
+    bool "启用串口手动测试邮件命令（mail test）"
+    default y
+    help
+        仅在 ESP32 控制台输入 mail test 并发送换行后请求一封 TEST 邮件。
+        不在开机或联网后自动发测试邮件，不改变传感器数据或真实告警。
+        使用本机配置的发件和收件邮箱；连续请求会限流。
+        关闭此项后停止读取测试命令，正常告警邮件仍可使用。
+
+config AIR_GATEWAY_MAIL_FROM
+    string "QQ 发件邮箱"
+    default ""
+
+config AIR_GATEWAY_MAIL_AUTH_CODE
+    string "QQ 邮箱 SMTP 授权码（不是 QQ 登录密码）"
+    default ""
+    help
+        仅在本机填写。不要将授权码发送到聊天、日志或提交到仓库。
+
+config AIR_GATEWAY_MAIL_TO
+    string "收件邮箱"
+    default ""
+
+endif
+endif
+endmenu
+
 endmenu

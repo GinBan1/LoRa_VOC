@@ -13,6 +13,8 @@ void Lora_App_Init(void);
 void Lora_App_Task(void);
 void Lora_App_Dio1Irq(void);
 uint8_t Lora_App_IsReady(void);
+/* 仅空闲任务在暂停调度、屏蔽中断后检查 STOP 条件。 */
+uint8_t Lora_App_CanStop(void);
 uint32_t Lora_App_GetNextWakeDelayMs(void);
 
 #endif /* LORA_APP_H */

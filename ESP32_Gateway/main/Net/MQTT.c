@@ -1,28 +1,12 @@
-//协议头文件
 #include "MQTT.h"
 
-//C库
 #include <string.h>
 #include <stdio.h>
 
 
 #define CMD_TOPIC_PREFIX        "$creq"
 
-volatile uint8_t mqtt_cmd_Receive = 0;//MQTT命令接收标志
-volatile uint8_t led_cmd_value = 0;//LED命令标志值
-//==========================================================
-//    函数名称：    MQTT_NewBuffer
-//
-//    函数功能：    申请内存
-//
-//    入口参数：    mqttPacket：包结构体
-//                size：大小
-//
-//    返回参数：    无
-//
-//    说明：        1.可使用动态分配来分配内存
-//                2.可使用局部或全局数组来指定内存
-//==========================================================
+/* 准备报文缓冲；未提供缓冲时动态分配。 */
 void MQTT_NewBuffer(MQTT_PACKET_STRUCTURE *mqttPacket, uint32 size)
 {
 
@@ -58,17 +42,7 @@ void MQTT_NewBuffer(MQTT_PACKET_STRUCTURE *mqttPacket, uint32 size)
 
 }
 
-//==========================================================
-//    函数名称：    MQTT_DeleteBuffer
-//
-//    函数功能：    释放数据内存
-//
-//    入口参数：    mqttPacket：包结构体
-//
-//    返回参数：    无
-//
-//    说明：
-//==========================================================
+/* 释放动态分配的报文缓冲，并清空结构。 */
 void MQTT_DeleteBuffer(MQTT_PACKET_STRUCTURE *mqttPacket)
 {
 
@@ -133,71 +107,205 @@ int32 MQTT_ReadLength(const uint8 *stream, int32 size, uint32 *len)
 
 }
 
-//==========================================================
-//    函数名称：    MQTT_UnPacketRecv
-//
-//    函数功能：    MQTT数据接收类型判断
-//
-//    入口参数：    dataPtr：接收的数据指针
-//
-//    返回参数：    0-成功        其他-失败原因
-//
-//    说明：
-//==========================================================
+/* 兼容入口，只能接收完整可读的报文。 */
 uint8 MQTT_UnPacketRecv(uint8 *dataPtr)
 {
-
-    uint8 status = 255;
-    uint8 type = dataPtr[0] >> 4;                //类型检查
-
-    if(type < 1 || type > 14)
-        return status;
-
-    if(type == MQTT_PKT_PUBLISH)
-    {
-        uint8 *msgPtr;
-        uint32 remain_len = 0;
-
-        msgPtr = dataPtr + MQTT_ReadLength(dataPtr + 1, 4, &remain_len) + 1;
-
-        if(remain_len < 2 || dataPtr[0] & 0x01)                    //retain
-            return 255;
-
-        if(remain_len < ((uint16)msgPtr[0] << 8 | msgPtr[1]) + 2)
-            return 255;
-
-        if(strstr((int8 *)msgPtr + 2, CMD_TOPIC_PREFIX) != NULL)    //如果是命令下发
-            status = MQTT_PKT_CMD;
-        else
-            status = MQTT_PKT_PUBLISH;
-    }
-    else
-        status = type;
-
-    return status;
-
+    size_t length = 0U;
+    if (MQTT_FrameLength(dataPtr, 5U, &length) < 0 || length == 0U)
+        return 255U;
+    return MQTT_UnPacketRecvLength(dataPtr, length);
 }
 
-//==========================================================
-//    函数名称：    MQTT_PacketConnect
-//
-//    函数功能：    连接消息组包
-//
-//    入口参数：    user：用户名：产品ID
-//                password：密码：鉴权信息或apikey
-//                devid：设备ID
-//                cTime：连接保持时间
-//                clean_session：离线消息清除标志
-//                qos：重发标志
-//                will_topic：异常离线topic
-//                will_msg：异常离线消息
-//                will_retain：消息推送标志
-//                mqttPacket：包指针
-//
-//    返回参数：    0-成功        其他-失败
-//
-//    说明：
-//==========================================================
+typedef struct
+{
+    size_t header_length;
+    size_t remaining_length;
+    size_t topic_length;
+    size_t payload_offset;
+    uint16 packet_id;
+    uint8 qos;
+} mqtt_frame_view_t;
+
+int32 MQTT_FrameLength(const uint8 *data, size_t available, size_t *frame_length)
+{
+    uint32 remaining = 0U;
+    uint32 multiplier = 1U;
+    uint8 type, flags;
+    size_t i;
+
+    if (frame_length == NULL) return -1;
+    *frame_length = 0U;
+    if (data == NULL) return available == 0U ? 0 : -1;
+    if (available == 0U) return 0;
+    type = data[0] >> 4;
+    flags = data[0] & 0x0FU;
+    if (type < MQTT_PKT_CONNECT || type > MQTT_PKT_DISCONNECT) return -1;
+    if (type == MQTT_PKT_PUBLISH)
+    {
+        uint8 qos = (flags >> 1) & 3U;
+        if (qos == 3U || (qos == 0U && (flags & 8U))) return -1;
+    }
+    else if (flags != ((type == MQTT_PKT_PUBREL || type == MQTT_PKT_SUBSCRIBE ||
+                        type == MQTT_PKT_UNSUBSCRIBE) ? 2U : 0U)) return -1;
+
+    for (i = 1U; i <= 4U; ++i)
+    {
+        uint8 encoded;
+        if (i >= available) return 0;
+        encoded = data[i];
+        remaining += (uint32)(encoded & 0x7FU) * multiplier;
+        if ((encoded & 0x80U) == 0U)
+        {
+            /* 拒绝带多余续字节的长度编码。 */
+            if (i > 1U && remaining < multiplier) return -1;
+            *frame_length = i + 1U + (size_t)remaining;
+            return available >= *frame_length ? 1 : 0;
+        }
+        multiplier *= 128U;
+    }
+    return -1;
+}
+
+static bool MQTT_View(const uint8 *data, size_t length, mqtt_frame_view_t *view)
+{
+    size_t total = 0U;
+    if (view == NULL || MQTT_FrameLength(data, length, &total) != 1 || total != length)
+        return false;
+    memset(view, 0, sizeof(*view));
+    view->header_length = 2U;
+    while ((data[view->header_length - 1U] & 0x80U) != 0U)
+        ++view->header_length;
+    view->remaining_length = length - view->header_length;
+    return true;
+}
+
+static bool MQTT_TopicValid(const uint8 *topic, size_t length)
+{
+    size_t i = 0U;
+    if (length == 0U) return false;
+    while (i < length)
+    {
+        uint32 code;
+        unsigned trailing;
+        uint8 first = topic[i++];
+        if (first == 0U || first == '+' || first == '#') return false;
+        if (first < 0x80U) continue;
+        if (first >= 0xC2U && first <= 0xDFU) { code = first & 0x1FU; trailing = 1U; }
+        else if (first >= 0xE0U && first <= 0xEFU) { code = first & 0x0FU; trailing = 2U; }
+        else if (first >= 0xF0U && first <= 0xF4U) { code = first & 7U; trailing = 3U; }
+        else return false;
+        if (length - i < trailing) return false;
+        for (unsigned n = 0U; n < trailing; ++n)
+        {
+            uint8 next = topic[i++];
+            if ((next & 0xC0U) != 0x80U) return false;
+            code = (code << 6) | (next & 0x3FU);
+        }
+        if ((trailing == 1U && code < 0x80U) || (trailing == 2U && code < 0x800U) ||
+            (trailing == 3U && code < 0x10000U) || code > 0x10FFFFU ||
+            (code >= 0xD800U && code <= 0xDFFFU)) return false;
+    }
+    return true;
+}
+
+static bool MQTT_PublishView(const uint8 *data, size_t length, mqtt_frame_view_t *view)
+{
+    size_t offset;
+    if (!MQTT_View(data, length, view) || data[0] >> 4 != MQTT_PKT_PUBLISH ||
+        view->remaining_length < 2U) return false;
+    offset = view->header_length;
+    view->topic_length = ((size_t)data[offset] << 8) | data[offset + 1U];
+    offset += 2U;
+    if (view->topic_length > length - offset ||
+        !MQTT_TopicValid(data + offset, view->topic_length)) return false;
+    offset += view->topic_length;
+    view->qos = (data[0] >> 1) & 3U;
+    if (view->qos != 0U)
+    {
+        if (length - offset < 2U) return false;
+        view->packet_id = (uint16)(((uint16)data[offset] << 8) | data[offset + 1U]);
+        if (view->packet_id == 0U) return false;
+        offset += 2U;
+    }
+    view->payload_offset = offset;
+    return length - offset <= UINT16_MAX;
+}
+
+static bool MQTT_CommandTopic(const uint8 *data, const mqtt_frame_view_t *view)
+{
+    const size_t prefix_length = sizeof(CMD_TOPIC_PREFIX) - 1U;
+    const uint8 *topic = data + view->header_length + 2U;
+    return view->topic_length >= prefix_length &&
+           memcmp(topic, CMD_TOPIC_PREFIX, prefix_length) == 0 &&
+           (view->topic_length == prefix_length || topic[prefix_length] == '/');
+}
+
+uint8 MQTT_UnPacketRecvLength(const uint8 *data, size_t length)
+{
+    mqtt_frame_view_t view;
+    uint8 type;
+    const uint8 *body;
+    if (!MQTT_View(data, length, &view)) return 255U;
+    type = data[0] >> 4;
+    body = data + view.header_length;
+    switch (type)
+    {
+        case MQTT_PKT_PUBLISH:
+            if (!MQTT_PublishView(data, length, &view)) return 255U;
+            return MQTT_CommandTopic(data, &view) ? MQTT_PKT_CMD : MQTT_PKT_PUBLISH;
+        case MQTT_PKT_CONNACK:
+            if (view.remaining_length != 2U || body[0] > 1U || body[1] > 5U ||
+                (body[1] != 0U && body[0] != 0U)) return 255U;
+            break;
+        case MQTT_PKT_PUBACK:
+        case MQTT_PKT_PUBREC:
+        case MQTT_PKT_PUBREL:
+        case MQTT_PKT_PUBCOMP:
+        case MQTT_PKT_UNSUBACK:
+            if (view.remaining_length != 2U || (body[0] == 0U && body[1] == 0U)) return 255U;
+            break;
+        case MQTT_PKT_SUBACK:
+            if (view.remaining_length < 3U || (body[0] == 0U && body[1] == 0U)) return 255U;
+            for (size_t i = 2U; i < view.remaining_length; ++i)
+                if (body[i] > 2U && body[i] != 0x80U) return 255U;
+            break;
+        case MQTT_PKT_PINGREQ:
+        case MQTT_PKT_PINGRESP:
+        case MQTT_PKT_DISCONNECT:
+            if (view.remaining_length != 0U) return 255U;
+            break;
+        default:
+            /* 接收端只解析服务器返回的报文。 */
+            return 255U;
+    }
+    return type;
+}
+
+uint8 MQTT_UnPacketConnectAckLength(const uint8 *data, size_t length)
+{
+    return MQTT_UnPacketRecvLength(data, length) == MQTT_PKT_CONNACK ? data[length - 1U] : 255U;
+}
+
+uint8 MQTT_UnPacketSubscribeLength(const uint8 *data, size_t length)
+{
+    mqtt_frame_view_t view;
+    const uint8 *body;
+    if (MQTT_UnPacketRecvLength(data, length) != MQTT_PKT_SUBACK || !MQTT_View(data, length, &view))
+        return 255U;
+    body = data + view.header_length;
+    if ((((uint16)body[0] << 8) | body[1]) != MQTT_SUBSCRIBE_ID) return 255U;
+    for (size_t i = 2U; i < view.remaining_length; ++i)
+        if (body[i] == 0x80U) return 1U;
+    return 0U;
+}
+
+uint1 MQTT_UnPacketPublishAckLength(const uint8 *data, size_t length)
+{
+    return MQTT_UnPacketRecvLength(data, length) != MQTT_PKT_PUBACK ||
+           (((uint16)data[2] << 8) | data[3]) != MQTT_PUBLISH_ID;
+}
+
+/* 组装 CONNECT 报文。 */
 uint8 MQTT_PacketConnect(const int8 *user, const int8 *password, const int8 *devid,
                         uint16 cTime, uint1 clean_session, uint1 qos,
                         const int8 *will_topic, const int8 *will_msg, int32 will_retain,
@@ -214,13 +322,13 @@ uint8 MQTT_PacketConnect(const int8 *user, const int8 *password, const int8 *dev
 
     total_len += devid_len + 2;
 
-    //断线后，是否清理离线消息：1-清理    0-不清理--------------------------------------------
+    /* 置位时清除旧会话。 */
     if(clean_session)
     {
         flags |= MQTT_CONNECT_CLEAN_SESSION;
     }
 
-    //异常掉线情况下，服务器发布的topic------------------------------------------------------
+    /* 异常断线后由服务端发布遗嘱。 */
     if(will_topic)
     {
         flags |= MQTT_CONNECT_WILL_FLAG;
@@ -228,7 +336,7 @@ uint8 MQTT_PacketConnect(const int8 *user, const int8 *password, const int8 *dev
         total_len += 4 + will_topic_len + strlen(will_msg);
     }
 
-    //qos级别--主要用于PUBLISH（发布态）消息的，保证消息传递的次数-----------------------------
+    /* 写入遗嘱消息的 QoS。 */
     switch((unsigned char)qos)
     {
         case MQTT_QOS_LEVEL0:
@@ -247,13 +355,13 @@ uint8 MQTT_PacketConnect(const int8 *user, const int8 *password, const int8 *dev
         return 2;
     }
 
-    //主要用于PUBLISH(发布态)的消息，表示服务器要保留这次推送的信息，如果有新的订阅者出现，就把这消息推送给它。如果不设那么推送至当前订阅的就释放了
+    /* 设置遗嘱的保留标志。 */
     if(will_retain)
     {
         flags |= (MQTT_CONNECT_WILL_FLAG | MQTT_CONNECT_WILL_RETAIN);
     }
 
-    //账号为空 密码为空---------------------------------------------------------------------
+    /* 账号为空 密码为空 */
     if(!user || !password)
     {
         return 3;
@@ -262,19 +370,18 @@ uint8 MQTT_PacketConnect(const int8 *user, const int8 *password, const int8 *dev
 
     total_len += strlen(user) + strlen(password) + 4;
 
-    //分配内存-----------------------------------------------------------------------------
+    /* 分配内存 */
     MQTT_NewBuffer(mqttPacket, total_len);
     if(mqttPacket->_data == NULL)
         return 4;
 
     memset(mqttPacket->_data, 0, total_len);
 
-/*************************************固定头部***********************************************/
 
-    //固定头部----------------------连接请求类型---------------------------------------------
+    /* 固定头部：连接请求类型 */
     mqttPacket->_data[mqttPacket->_len++] = MQTT_PKT_CONNECT << 4;
 
-    //固定头部----------------------剩余长度值-----------------------------------------------
+    /* 固定头部：剩余长度值 */
     len = MQTT_DumpLength(total_len - 5, mqttPacket->_data + mqttPacket->_len);
     if(len < 0)
     {
@@ -284,9 +391,8 @@ uint8 MQTT_PacketConnect(const int8 *user, const int8 *password, const int8 *dev
     else
         mqttPacket->_len += len;
 
-/*************************************可变头部***********************************************/
 
-    //可变头部----------------------协议名长度 和 协议名--------------------------------------
+    /* 可变头部：协议名长度 和 协议名 */
     mqttPacket->_data[mqttPacket->_len++] = 0;
     mqttPacket->_data[mqttPacket->_len++] = 4;
     mqttPacket->_data[mqttPacket->_len++] = 'M';
@@ -294,26 +400,25 @@ uint8 MQTT_PacketConnect(const int8 *user, const int8 *password, const int8 *dev
     mqttPacket->_data[mqttPacket->_len++] = 'T';
     mqttPacket->_data[mqttPacket->_len++] = 'T';
 
-    //可变头部----------------------protocol level 4-----------------------------------------
+    /* 可变头部：协议级别 4 */
     mqttPacket->_data[mqttPacket->_len++] = 4;
 
-    //可变头部----------------------连接标志(该函数开头处理的数据)-----------------------------
+    /* 可变头部：连接标志(该函数开头处理的数据) */
     mqttPacket->_data[mqttPacket->_len++] = flags;
 
-    //可变头部----------------------保持连接的时间(秒)----------------------------------------
+    /* 可变头部：保持连接的时间(秒) */
     mqttPacket->_data[mqttPacket->_len++] = MOSQ_MSB(cTime);
     mqttPacket->_data[mqttPacket->_len++] = MOSQ_LSB(cTime);
 
-/*************************************消息体************************************************/
 
-    //消息体----------------------------devid长度、devid-------------------------------------
+    /* 消息体：设备 ID长度、设备 ID */
     mqttPacket->_data[mqttPacket->_len++] = MOSQ_MSB(devid_len);
     mqttPacket->_data[mqttPacket->_len++] = MOSQ_LSB(devid_len);
 
     memcpy((int8 *)mqttPacket->_data + mqttPacket->_len, devid, devid_len);
     mqttPacket->_len += devid_len;
 
-    //消息体----------------------------will_flag 和 will_msg---------------------------------
+    /* 消息体：遗嘱标志 和 遗嘱内容 */
     if(flags & MQTT_CONNECT_WILL_FLAG)
     {
         unsigned short mLen = 0;
@@ -334,7 +439,7 @@ uint8 MQTT_PacketConnect(const int8 *user, const int8 *password, const int8 *dev
         mqttPacket->_len += mLen;
     }
 
-    //消息体----------------------------use---------------------------------------------------
+    /* 写入用户名。 */
     if(flags & MQTT_CONNECT_USER_NAME)
     {
         unsigned short user_len = strlen(user);
@@ -345,13 +450,13 @@ uint8 MQTT_PacketConnect(const int8 *user, const int8 *password, const int8 *dev
         mqttPacket->_len += user_len;
     }
 
-    //消息体----------------------------password----------------------------------------------
+    /* 消息体：密码 */
     if(flags & MQTT_CONNECT_PASSORD)
     {
         unsigned short psw_len = strlen(password);
 
-        // OneNET MQTT 服务器可能截断很长的 token 作为 password
-        // 但 MQTT 协议标准允许 password 字段很长
+        /* OneNET 可能截断过长的 Token。 */
+
         mqttPacket->_data[mqttPacket->_len++] = MOSQ_MSB(psw_len);
         mqttPacket->_data[mqttPacket->_len++] = MOSQ_LSB(psw_len);
         memcpy((int8 *)mqttPacket->_data + mqttPacket->_len, password, psw_len);
@@ -362,17 +467,7 @@ uint8 MQTT_PacketConnect(const int8 *user, const int8 *password, const int8 *dev
 
 }
 
-//==========================================================
-//    函数名称：    MQTT_PacketDisConnect
-//
-//    函数功能：    断开连接消息组包
-//
-//    入口参数：    mqttPacket：包指针
-//
-//    返回参数：    0-成功        1-失败
-//
-//    说明：
-//==========================================================
+/* 组装 DISCONNECT 报文。 */
 uint1 MQTT_PacketDisConnect(MQTT_PACKET_STRUCTURE *mqttPacket)
 {
 
@@ -380,57 +475,26 @@ uint1 MQTT_PacketDisConnect(MQTT_PACKET_STRUCTURE *mqttPacket)
     if(mqttPacket->_data == NULL)
         return 1;
 
-/*************************************固定头部***********************************************/
 
-    //固定头部----------------------头部消息-------------------------------------------------
+    /* 固定头部：头部消息 */
     mqttPacket->_data[mqttPacket->_len++] = MQTT_PKT_DISCONNECT << 4;
 
-    //固定头部----------------------剩余长度值-----------------------------------------------
+    /* 固定头部：剩余长度值 */
     mqttPacket->_data[mqttPacket->_len++] = 0;
 
     return 0;
 
 }
 
-//==========================================================
-//    函数名称：    MQTT_UnPacketConnectAck
-//
-//    函数功能：    连接消息解包
-//
-//    入口参数：    rev_data：接收的数据
-//
-//    返回参数：    1、255-失败        其他-平台的返回码
-//
-//    说明：
-//==========================================================
+/* 解析连接应答。 */
 uint8 MQTT_UnPacketConnectAck(uint8 *rev_data)
 {
-
-    if(rev_data[1] != 2)
-        return 1;
-
-    if(rev_data[2] == 0 || rev_data[2] == 1)
-        return rev_data[3];
-    else
-        return 255;
-
+    size_t length = 0U;
+    if (MQTT_FrameLength(rev_data, 5U, &length) < 0 || length == 0U) return 255U;
+    return MQTT_UnPacketConnectAckLength(rev_data, length);
 }
 
-//==========================================================
-//    函数名称：    MQTT_PacketSaveData
-//
-//    函数功能：    数据点上传组包
-//
-//    入口参数：    pro_id：产品ID(可为空)
-//                dev_name：设备名
-//                send_buf：json缓存buf
-//                send_len：json总长
-//                type_bin_head：bin文件的消息头
-//
-//    返回参数：    0-成功        1-失败
-//
-//    说明：
-//==========================================================
+/* 组装 OneNET 数据点上传报文。 */
 uint1 MQTT_PacketSaveData(const int8 *pro_id, const char *dev_name,
                                 int16 send_len, int8 *type_bin_head, MQTT_PACKET_STRUCTURE *mqttPacket)
 {
@@ -441,10 +505,7 @@ uint1 MQTT_PacketSaveData(const int8 *pro_id, const char *dev_name,
 
     if(MQTT_PacketPublish(MQTT_PUBLISH_ID, topic_buf, NULL, send_len + 0, MQTT_QOS_LEVEL1, 0, 1, mqttPacket) == 0)
     {
-//        mqttPacket->_data[mqttPacket->_len++] = type;                    //类型
 //
-//        mqttPacket->_data[mqttPacket->_len++] = MOSQ_MSB(send_len);
-//        mqttPacket->_data[mqttPacket->_len++] = MOSQ_LSB(send_len);
     }
     else
         return 1;
@@ -453,19 +514,7 @@ uint1 MQTT_PacketSaveData(const int8 *pro_id, const char *dev_name,
 
 }
 
-//==========================================================
-//    函数名称：    MQTT_PacketSaveBinData
-//
-//    函数功能：    为禁止文件上传组包
-//
-//    入口参数：    name：数据流名字
-//                file_len：文件长度
-//                mqttPacket：包指针
-//
-//    返回参数：    0-成功        1-失败
-//
-//    说明：
-//==========================================================
+/* 组装二进制文件上传报文。 */
 uint1 MQTT_PacketSaveBinData(const int8 *name, int16 file_len, MQTT_PACKET_STRUCTURE *mqttPacket)
 {
 
@@ -514,19 +563,7 @@ uint1 MQTT_PacketSaveBinData(const int8 *name, int16 file_len, MQTT_PACKET_STRUC
 
 }
 
-//==========================================================
-//    函数名称：    MQTT_UnPacketCmd
-//
-//    函数功能：    命令下发解包
-//
-//    入口参数：    rev_data：接收的数据指针
-//                cmdid：cmdid-uuid
-//                req：命令
-//
-//    返回参数：    0-成功        其他-失败原因
-//
-//    说明：
-//==========================================================
+/* 解析下发命令。 */
 uint8 MQTT_UnPacketCmd(uint8 *rev_data, int8 **cmdid, int8 **req, uint16 *req_len)
 {
 
@@ -563,19 +600,7 @@ uint8 MQTT_UnPacketCmd(uint8 *rev_data, int8 **cmdid, int8 **req, uint16 *req_le
 
 }
 
-//==========================================================
-//    函数名称：    MQTT_PacketCmdResp
-//
-//    函数功能：    命令回复组包
-//
-//    入口参数：    cmdid：cmdid
-//                req：命令
-//                mqttPacket：包指针
-//
-//    返回参数：    0-成功        1-失败
-//
-//    说明：
-//==========================================================
+/* 组装命令应答。 */
 uint1 MQTT_PacketCmdResp(const int8 *cmdid, const int8 *req, MQTT_PACKET_STRUCTURE *mqttPacket)
 {
 
@@ -602,21 +627,7 @@ uint1 MQTT_PacketCmdResp(const int8 *cmdid, const int8 *req, MQTT_PACKET_STRUCTU
 
 }
 
-//==========================================================
-//    函数名称：    MQTT_PacketSubscribe
-//
-//    函数功能：    Subscribe消息组包
-//
-//    入口参数：    pkt_id：pkt_id
-//                qos：消息重发次数
-//                topics：订阅的消息
-//                topics_cnt：订阅的消息个数
-//                mqttPacket：包指针
-//
-//    返回参数：    0-成功        其他-失败
-//
-//    说明：
-//==========================================================
+/* 组装 SUBSCRIBE 报文。 */
 uint8 MQTT_PacketSubscribe(uint16 pkt_id, enum MqttQosLevel qos, const int8 *topics[], uint8 topics_cnt, MQTT_PACKET_STRUCTURE *mqttPacket)
 {
 
@@ -627,7 +638,7 @@ uint8 MQTT_PacketSubscribe(uint16 pkt_id, enum MqttQosLevel qos, const int8 *top
     if(pkt_id == 0)
         return 1;
 
-    //计算topic长度-------------------------------------------------------------------------
+    /* 计算主题长度 */
     for(; i < topics_cnt; i++)
     {
         if(topics[i] == NULL)
@@ -636,20 +647,19 @@ uint8 MQTT_PacketSubscribe(uint16 pkt_id, enum MqttQosLevel qos, const int8 *top
         topic_len += strlen(topics[i]);
     }
 
-    //2 bytes packet id + topic filter(2 bytes topic + topic length + 1 byte reserve)------
+    /* 长度含报文编号和主题过滤器；每个过滤器另含 2 字节长度及 1 字节 QoS。 */
     remain_len = 2 + 3 * topics_cnt + topic_len;
 
-    //分配内存------------------------------------------------------------------------------
+    /* 分配内存 */
     MQTT_NewBuffer(mqttPacket, remain_len + 5);
     if(mqttPacket->_data == NULL)
         return 3;
 
-/*************************************固定头部***********************************************/
 
-    //固定头部----------------------头部消息-------------------------------------------------
+    /* 固定头部：头部消息 */
     mqttPacket->_data[mqttPacket->_len++] = MQTT_PKT_SUBSCRIBE << 4 | 0x02;
 
-    //固定头部----------------------剩余长度值-----------------------------------------------
+    /* 固定头部：剩余长度值 */
     len = MQTT_DumpLength(remain_len, mqttPacket->_data + mqttPacket->_len);
     if(len < 0)
     {
@@ -659,13 +669,12 @@ uint8 MQTT_PacketSubscribe(uint16 pkt_id, enum MqttQosLevel qos, const int8 *top
     else
         mqttPacket->_len += len;
 
-/*************************************payload***********************************************/
 
-    //payload----------------------pkt_id---------------------------------------------------
+    /* 载荷：报文编号 */
     mqttPacket->_data[mqttPacket->_len++] = MOSQ_MSB(pkt_id);
     mqttPacket->_data[mqttPacket->_len++] = MOSQ_LSB(pkt_id);
 
-    //payload----------------------topic_name-----------------------------------------------
+    /* 载荷：主题 */
     for(i = 0; i < topics_cnt; i++)
     {
         topic_len = strlen(topics[i]);
@@ -682,63 +691,15 @@ uint8 MQTT_PacketSubscribe(uint16 pkt_id, enum MqttQosLevel qos, const int8 *top
 
 }
 
-//==========================================================
-//    函数名称：    MQTT_UnPacketSubscribe
-//
-//    函数功能：    Subscribe的回复消息解包
-//
-//    入口参数：    rev_data：接收到的信息
-//
-//    返回参数：    0-成功        其他-失败
-//
-//    说明：
-//==========================================================
+/* 解析订阅确认。 */
 uint8 MQTT_UnPacketSubscribe(uint8 *rev_data)
 {
-
-    uint8 result = 255;
-
-    if(rev_data[2] == MOSQ_MSB(MQTT_SUBSCRIBE_ID) && rev_data[3] == MOSQ_LSB(MQTT_SUBSCRIBE_ID))
-    {
-        switch(rev_data[4])
-        {
-            case 0x00:
-            case 0x01:
-            case 0x02:
-                //MQTT Subscribe OK
-                result = 0;
-            break;
-
-            case 0x80:
-                //MQTT Subscribe Failed
-                result = 1;
-            break;
-
-            default:
-                //MQTT Subscribe UnKnown Err
-                result = 2;
-            break;
-        }
-    }
-
-    return result;
-
+    size_t length = 0U;
+    if (MQTT_FrameLength(rev_data, 5U, &length) < 0 || length == 0U) return 255U;
+    return MQTT_UnPacketSubscribeLength(rev_data, length);
 }
 
-//==========================================================
-//    函数名称：    MQTT_PacketUnSubscribe
-//
-//    函数功能：    UnSubscribe消息组包
-//
-//    入口参数：    pkt_id：pkt_id
-//                topics：订阅的消息
-//                topics_cnt：订阅的消息个数
-//                mqttPacket：包指针
-//
-//    返回参数：    0-成功        其他-失败
-//
-//    说明：
-//==========================================================
+/* 组装 UNSUBSCRIBE 报文。 */
 uint8 MQTT_PacketUnSubscribe(uint16 pkt_id, const int8 *topics[], uint8 topics_cnt, MQTT_PACKET_STRUCTURE *mqttPacket)
 {
 
@@ -749,7 +710,7 @@ uint8 MQTT_PacketUnSubscribe(uint16 pkt_id, const int8 *topics[], uint8 topics_c
     if(pkt_id == 0)
         return 1;
 
-    //计算topic长度-------------------------------------------------------------------------
+    /* 计算主题长度 */
     for(; i < topics_cnt; i++)
     {
         if(topics[i] == NULL)
@@ -758,20 +719,19 @@ uint8 MQTT_PacketUnSubscribe(uint16 pkt_id, const int8 *topics[], uint8 topics_c
         topic_len += strlen(topics[i]);
     }
 
-    //2 bytes packet id, 2 bytes topic length + topic + 1 byte reserve---------------------
+    /* 长度含 2 字节报文编号和每个主题的长度字段及主题内容。 */
     remain_len = 2 + (topics_cnt << 1) + topic_len;
 
-    //分配内存------------------------------------------------------------------------------
+    /* 分配内存 */
     MQTT_NewBuffer(mqttPacket, remain_len + 5);
     if(mqttPacket->_data == NULL)
         return 3;
 
-/*************************************固定头部***********************************************/
 
-    //固定头部----------------------头部消息-------------------------------------------------
+    /* 固定头部：头部消息 */
     mqttPacket->_data[mqttPacket->_len++] = MQTT_PKT_UNSUBSCRIBE << 4 | 0x02;
 
-    //固定头部----------------------剩余长度值-----------------------------------------------
+    /* 固定头部：剩余长度值 */
     len = MQTT_DumpLength(remain_len, mqttPacket->_data + mqttPacket->_len);
     if(len < 0)
     {
@@ -781,13 +741,12 @@ uint8 MQTT_PacketUnSubscribe(uint16 pkt_id, const int8 *topics[], uint8 topics_c
     else
         mqttPacket->_len += len;
 
-/*************************************payload***********************************************/
 
-    //payload----------------------pkt_id---------------------------------------------------
+    /* 载荷：报文编号 */
     mqttPacket->_data[mqttPacket->_len++] = MOSQ_MSB(pkt_id);
     mqttPacket->_data[mqttPacket->_len++] = MOSQ_LSB(pkt_id);
 
-    //payload----------------------topic_name-----------------------------------------------
+    /* 载荷：主题 */
     for(i = 0; i < topics_cnt; i++)
     {
         topic_len = strlen(topics[i]);
@@ -802,17 +761,7 @@ uint8 MQTT_PacketUnSubscribe(uint16 pkt_id, const int8 *topics[], uint8 topics_c
 
 }
 
-//==========================================================
-//    函数名称：    MQTT_UnPacketUnSubscribe
-//
-//    函数功能：    UnSubscribe的回复消息解包
-//
-//    入口参数：    rev_data：接收到的信息
-//
-//    返回参数：    0-成功        其他-失败
-//
-//    说明：
-//==========================================================
+/* 解析取消订阅确认。 */
 uint1 MQTT_UnPacketUnSubscribe(uint8 *rev_data)
 {
 
@@ -827,24 +776,7 @@ uint1 MQTT_UnPacketUnSubscribe(uint8 *rev_data)
 
 }
 
-//==========================================================
-//    函数名称：    MQTT_PacketPublish
-//
-//    函数功能：    Publish消息组包
-//
-//    入口参数：    pkt_id：pkt_id
-//                topic：发布的topic
-//                payload：消息体
-//                payload_len：消息体长度
-//                qos：重发次数
-//                retain：离线消息推送
-//                own：
-//                mqttPacket：包指针
-//
-//    返回参数：    0-成功        其他-失败
-//
-//    说明：
-//==========================================================
+/* 组装 PUBLISH 报文。 */
 uint8 MQTT_PacketPublish(uint16 pkt_id, const int8 *topic,
                         const int8 *payload, uint32 payload_len,
                         enum MqttQosLevel qos, int32 retain, int32 own,
@@ -856,28 +788,28 @@ uint8 MQTT_PacketPublish(uint16 pkt_id, const int8 *topic,
     int32 len = 0;
     uint8 flags = 0;
 
-    //pkt_id检查----------------------------------------------------------------------------
+    /* 报文编号检查 */
     if(pkt_id == 0)
         return 1;
 
-    //$dp为系统上传数据点的指令--------------------------------------------------------------
+    /* $dp为系统上传数据点的指令 */
     for(topic_len = 0; topic[topic_len] != '\0'; ++topic_len)
     {
         if((topic[topic_len] == '#') || (topic[topic_len] == '+'))
             return 2;
     }
 
-    //Publish消息---------------------------------------------------------------------------
+    /* Publish消息 */
     flags |= MQTT_PKT_PUBLISH << 4;
 
-    //retain标志----------------------------------------------------------------------------
+    /* retain标志 */
     if(retain)
         flags |= 0x01;
 
-    //总长度--------------------------------------------------------------------------------
+    /* 总长度 */
     total_len = topic_len + payload_len + 2;
 
-    //qos级别--主要用于PUBLISH（发布态）消息的，保证消息传递的次数-----------------------------
+    /* 写入遗嘱消息的 QoS。 */
     switch(qos)
     {
         case MQTT_QOS_LEVEL0:
@@ -898,7 +830,7 @@ uint8 MQTT_PacketPublish(uint16 pkt_id, const int8 *topic,
         return 3;
     }
 
-    //分配内存------------------------------------------------------------------------------
+    /* 分配内存 */
     if(payload != NULL)
     {
         if(payload[0] == 2)
@@ -937,12 +869,11 @@ uint8 MQTT_PacketPublish(uint16 pkt_id, const int8 *topic,
         memset(mqttPacket->_data, 0, total_len + 5);
     }
 
-/*************************************固定头部***********************************************/
 
-    //固定头部----------------------头部消息-------------------------------------------------
+    /* 固定头部：头部消息 */
     mqttPacket->_data[mqttPacket->_len++] = flags;
 
-    //固定头部----------------------剩余长度值-----------------------------------------------
+    /* 固定头部：剩余长度值 */
     len = MQTT_DumpLength(total_len, mqttPacket->_data + mqttPacket->_len);
     if(len < 0)
     {
@@ -952,9 +883,8 @@ uint8 MQTT_PacketPublish(uint16 pkt_id, const int8 *topic,
     else
         mqttPacket->_len += len;
 
-/*************************************可变头部***********************************************/
 
-    //可变头部----------------------写入topic长度、topic-------------------------------------
+    /* 可变头部：写入主题长度、主题 */
     mqttPacket->_data[mqttPacket->_len++] = MOSQ_MSB(topic_len);
     mqttPacket->_data[mqttPacket->_len++] = MOSQ_LSB(topic_len);
 
@@ -966,7 +896,7 @@ uint8 MQTT_PacketPublish(uint16 pkt_id, const int8 *topic,
         mqttPacket->_data[mqttPacket->_len++] = MOSQ_LSB(pkt_id);
     }
 
-    //可变头部----------------------写入payload----------------------------------------------
+    /* 可变头部：写入载荷 */
     if(payload != NULL)
     {
         if(payload[0] == 2)
@@ -985,120 +915,58 @@ uint8 MQTT_PacketPublish(uint16 pkt_id, const int8 *topic,
 
 }
 
-//==========================================================
-//    函数名称：    MQTT_UnPacketPublish
-//
-//    函数功能：    Publish消息解包
-//
-//    入口参数：    rev_data：收到的数据
-//
-//    返回参数：    0-成功        其他-失败原因
-//
-//    说明：
-//==========================================================
-uint8 MQTT_UnPacketPublish(uint8 *rev_data, int8 **topic, uint16 *topic_len, int8 **payload, uint16 *payload_len, uint8 *qos, uint16 *pkt_id)
+/* 兼容入口，只能解包完整可读的 PUBLISH 报文。 */
+uint8 MQTT_UnPacketPublishLength(const uint8 *data, size_t length,
+    int8 **topic, uint16 *topic_len, int8 **payload, uint16 *payload_len,
+    uint8 *qos, uint16 *pkt_id)
 {
+    mqtt_frame_view_t view;
+    int8 *topic_copy, *payload_copy;
+    size_t payload_size;
 
-    const int8 flags = rev_data[0] & 0x0F;
-    uint8 *msgPtr;
-    uint32 remain_len = 0;
-
-    const int8 dup = flags & 0x08;
-
-    *qos = (flags & 0x06) >> 1;
-
-    msgPtr = rev_data + MQTT_ReadLength(rev_data + 1, 4, &remain_len) + 1;
-
-    if(remain_len < 2 || flags & 0x01)                            //retain
-        return 255;
-
-    *topic_len = (uint16)msgPtr[0] << 8 | msgPtr[1];
-    if(remain_len < *topic_len + 2)
-        return 255;
-
-    if(strstr((int8 *)msgPtr + 2, CMD_TOPIC_PREFIX) != NULL)    //如果是命令下发
-        return MQTT_PKT_CMD;
-
-    switch(*qos)
+    /* 失败时清空输出，避免调用方拿到半成品缓冲。 */
+    if (topic != NULL) *topic = NULL;
+    if (payload != NULL) *payload = NULL;
+    if (topic_len != NULL) *topic_len = 0U;
+    if (payload_len != NULL) *payload_len = 0U;
+    if (qos != NULL) *qos = 0U;
+    if (pkt_id != NULL) *pkt_id = 0U;
+    if (topic == NULL || payload == NULL || topic == payload || topic_len == NULL ||
+        payload_len == NULL || qos == NULL || pkt_id == NULL ||
+        !MQTT_PublishView(data, length, &view)) return 255U;
+    if (MQTT_CommandTopic(data, &view)) return MQTT_PKT_CMD;
+    payload_size = length - view.payload_offset;
+    topic_copy = MQTT_MallocBuffer(view.topic_length + 1U);
+    if (topic_copy == NULL) return 255U;
+    payload_copy = MQTT_MallocBuffer(payload_size + 1U);
+    if (payload_copy == NULL)
     {
-        case MQTT_QOS_LEVEL0:                                    // qos0 have no packet identifier
-
-            if(0 != dup)
-                return 255;
-
-            *topic = MQTT_MallocBuffer(*topic_len + 1);            //为topic分配内存
-            if(*topic == NULL)
-                return 255;
-
-            memset(*topic, 0, *topic_len + 1);
-            memcpy(*topic, (int8 *)msgPtr + 2, *topic_len);        //复制数据
-
-            *payload_len = remain_len - 2 - *topic_len;            //为payload分配内存
-            *payload = MQTT_MallocBuffer(*payload_len + 1);
-            if(*payload == NULL)                                //如果失败
-            {
-                MQTT_FreeBuffer(*topic);                        //则需要把topic的内存释放掉
-                return 255;
-            }
-
-            memset(*payload, 0, *payload_len + 1);
-            memcpy(*payload, (int8 *)msgPtr + 2 + *topic_len, *payload_len);
-
-        break;
-
-        case MQTT_QOS_LEVEL1:
-        case MQTT_QOS_LEVEL2:
-
-            if(*topic_len + 2 > remain_len)
-                return 255;
-
-            *pkt_id = (uint16)msgPtr[*topic_len + 2] << 8 | msgPtr[*topic_len + 3];
-            if(pkt_id == 0)
-                return 255;
-
-            *topic = MQTT_MallocBuffer(*topic_len + 1);            //为topic分配内存
-            if(*topic == NULL)
-                return 255;
-
-            memset(*topic, 0, *topic_len + 1);
-            memcpy(*topic, (int8 *)msgPtr + 2, *topic_len);        //复制数据
-
-            *payload_len = remain_len - 4 - *topic_len;
-            *payload = MQTT_MallocBuffer(*payload_len + 1);        //为payload分配内存
-            if(*payload == NULL)                                //如果失败
-            {
-                MQTT_FreeBuffer(*topic);                        //则需要把topic的内存释放掉
-                return 255;
-            }
-
-            memset(*payload, 0, *payload_len + 1);
-            memcpy(*payload, (int8 *)msgPtr + 4 + *topic_len, *payload_len);
-
-        break;
-
-        default:
-            return 255;
+        MQTT_FreeBuffer(topic_copy);
+        return 255U;
     }
-
-    if(strchr((int8 *)*topic, '+') || strchr((int8 *)*topic, '#'))
-        return 255;
-
-    return 0;
-
+    memcpy(topic_copy, data + view.header_length + 2U, view.topic_length);
+    topic_copy[view.topic_length] = '\0';
+    memcpy(payload_copy, data + view.payload_offset, payload_size);
+    payload_copy[payload_size] = '\0';
+    *topic = topic_copy;
+    *payload = payload_copy;
+    *topic_len = (uint16)view.topic_length;
+    *payload_len = (uint16)payload_size;
+    *qos = view.qos;
+    *pkt_id = view.packet_id;
+    return 0U;
 }
 
-//==========================================================
-//    函数名称：    MQTT_PacketPublishAck
-//
-//    函数功能：    Publish Ack消息组包
-//
-//    入口参数：    pkt_id：packet id
-//                mqttPacket：包指针
-//
-//    返回参数：    0-成功        1-失败原因
-//
-//    说明：        当收到的Publish消息的QoS等级为1时，需要Ack回复
-//==========================================================
+uint8 MQTT_UnPacketPublish(uint8 *rev_data, int8 **topic, uint16 *topic_len,
+                          int8 **payload, uint16 *payload_len, uint8 *qos, uint16 *pkt_id)
+{
+    size_t length = 0U;
+    if (MQTT_FrameLength(rev_data, 5U, &length) < 0) length = 0U;
+    return MQTT_UnPacketPublishLength(rev_data, length, topic, topic_len,
+                                      payload, payload_len, qos, pkt_id);
+}
+
+/* 组装 QoS 1 的发布确认。 */
 uint1 MQTT_PacketPublishAck(uint16 pkt_id, MQTT_PACKET_STRUCTURE *mqttPacket)
 {
 
@@ -1106,17 +974,15 @@ uint1 MQTT_PacketPublishAck(uint16 pkt_id, MQTT_PACKET_STRUCTURE *mqttPacket)
     if(mqttPacket->_data == NULL)
         return 1;
 
-/*************************************固定头部***********************************************/
 
-    //固定头部----------------------头部消息-------------------------------------------------
+    /* 固定头部：头部消息 */
     mqttPacket->_data[mqttPacket->_len++] = MQTT_PKT_PUBACK << 4;
 
-    //固定头部----------------------剩余长度-------------------------------------------------
+    /* 固定头部：剩余长度 */
     mqttPacket->_data[mqttPacket->_len++] = 2;
 
-/*************************************可变头部***********************************************/
 
-    //可变头部----------------------pkt_id长度-----------------------------------------------
+    /* 可变头部：报文编号长度 */
     mqttPacket->_data[mqttPacket->_len++] = pkt_id >> 8;
     mqttPacket->_data[mqttPacket->_len++] = pkt_id & 0xff;
 
@@ -1124,42 +990,15 @@ uint1 MQTT_PacketPublishAck(uint16 pkt_id, MQTT_PACKET_STRUCTURE *mqttPacket)
 
 }
 
-//==========================================================
-//    函数名称：    MQTT_UnPacketPublishAck
-//
-//    函数功能：    Publish Ack消息解包
-//
-//    入口参数：    rev_data：收到的数据
-//
-//    返回参数：    0-成功        1-失败原因
-//
-//    说明：
-//==========================================================
+/* 解析发布确认。 */
 uint1 MQTT_UnPacketPublishAck(uint8 *rev_data)
 {
-
-    if(rev_data[1] != 2)
-        return 1;
-
-    if(rev_data[2] == MOSQ_MSB(MQTT_PUBLISH_ID) && rev_data[3] == MOSQ_LSB(MQTT_PUBLISH_ID))
-        return 0;
-    else
-        return 1;
-
+    size_t length = 0U;
+    if (MQTT_FrameLength(rev_data, 5U, &length) < 0 || length == 0U) return 1U;
+    return MQTT_UnPacketPublishAckLength(rev_data, length);
 }
 
-//==========================================================
-//    函数名称：    MQTT_PacketPublishRec
-//
-//    函数功能：    Publish Rec消息组包
-//
-//    入口参数：    pkt_id：packet id
-//                mqttPacket：包指针
-//
-//    返回参数：    0-成功        1-失败原因
-//
-//    说明：        当收到的Publish消息的QoS等级为2时，先收到rec
-//==========================================================
+/* 组装 QoS 2 的 PUBREC 报文。 */
 uint1 MQTT_PacketPublishRec(uint16 pkt_id, MQTT_PACKET_STRUCTURE *mqttPacket)
 {
 
@@ -1167,17 +1006,15 @@ uint1 MQTT_PacketPublishRec(uint16 pkt_id, MQTT_PACKET_STRUCTURE *mqttPacket)
     if(mqttPacket->_data == NULL)
         return 1;
 
-/*************************************固定头部***********************************************/
 
-    //固定头部----------------------头部消息-------------------------------------------------
+    /* 固定头部：头部消息 */
     mqttPacket->_data[mqttPacket->_len++] = MQTT_PKT_PUBREC << 4;
 
-    //固定头部----------------------剩余长度-------------------------------------------------
+    /* 固定头部：剩余长度 */
     mqttPacket->_data[mqttPacket->_len++] = 2;
 
-/*************************************可变头部***********************************************/
 
-    //可变头部----------------------pkt_id长度-----------------------------------------------
+    /* 可变头部：报文编号长度 */
     mqttPacket->_data[mqttPacket->_len++] = pkt_id >> 8;
     mqttPacket->_data[mqttPacket->_len++] = pkt_id & 0xff;
 
@@ -1185,17 +1022,7 @@ uint1 MQTT_PacketPublishRec(uint16 pkt_id, MQTT_PACKET_STRUCTURE *mqttPacket)
 
 }
 
-//==========================================================
-//    函数名称：    MQTT_UnPacketPublishRec
-//
-//    函数功能：    Publish Rec消息解包
-//
-//    入口参数：    rev_data：接收到的数据
-//
-//    返回参数：    0-成功        1-失败
-//
-//    说明：
-//==========================================================
+/* 解析 PUBREC。 */
 uint1 MQTT_UnPacketPublishRec(uint8 *rev_data)
 {
 
@@ -1209,18 +1036,7 @@ uint1 MQTT_UnPacketPublishRec(uint8 *rev_data)
 
 }
 
-//==========================================================
-//    函数名称：    MQTT_PacketPublishRel
-//
-//    函数功能：    Publish Rel消息组包
-//
-//    入口参数：    pkt_id：packet id
-//                mqttPacket：包指针
-//
-//    返回参数：    0-成功        1-失败原因
-//
-//    说明：        当收到的Publish消息的QoS等级为2时，先收到rec，再回复rel
-//==========================================================
+/* 组装 QoS 2 的 PUBREL 报文。 */
 uint1 MQTT_PacketPublishRel(uint16 pkt_id, MQTT_PACKET_STRUCTURE *mqttPacket)
 {
 
@@ -1228,17 +1044,15 @@ uint1 MQTT_PacketPublishRel(uint16 pkt_id, MQTT_PACKET_STRUCTURE *mqttPacket)
     if(mqttPacket->_data == NULL)
         return 1;
 
-/*************************************固定头部***********************************************/
 
-    //固定头部----------------------头部消息-------------------------------------------------
+    /* 固定头部：头部消息 */
     mqttPacket->_data[mqttPacket->_len++] = MQTT_PKT_PUBREL << 4 | 0x02;
 
-    //固定头部----------------------剩余长度-------------------------------------------------
+    /* 固定头部：剩余长度 */
     mqttPacket->_data[mqttPacket->_len++] = 2;
 
-/*************************************可变头部***********************************************/
 
-    //可变头部----------------------pkt_id长度-----------------------------------------------
+    /* 可变头部：报文编号长度 */
     mqttPacket->_data[mqttPacket->_len++] = pkt_id >> 8;
     mqttPacket->_data[mqttPacket->_len++] = pkt_id & 0xff;
 
@@ -1246,17 +1060,7 @@ uint1 MQTT_PacketPublishRel(uint16 pkt_id, MQTT_PACKET_STRUCTURE *mqttPacket)
 
 }
 
-//==========================================================
-//    函数名称：    MQTT_UnPacketPublishRel
-//
-//    函数功能：    Publish Rel消息解包
-//
-//    入口参数：    rev_data：接收到的数据
-//
-//    返回参数：    0-成功        1-失败
-//
-//    说明：
-//==========================================================
+/* 解析 PUBREL。 */
 uint1 MQTT_UnPacketPublishRel(uint8 *rev_data, uint16 pkt_id)
 {
 
@@ -1270,18 +1074,7 @@ uint1 MQTT_UnPacketPublishRel(uint8 *rev_data, uint16 pkt_id)
 
 }
 
-//==========================================================
-//    函数名称：    MQTT_PacketPublishComp
-//
-//    函数功能：    Publish Comp消息组包
-//
-//    入口参数：    pkt_id：packet id
-//                mqttPacket：包指针
-//
-//    返回参数：    0-成功        1-失败原因
-//
-//    说明：        当收到的Publish消息的QoS等级为2时，先收到rec，再回复rel
-//==========================================================
+/* 组装 QoS 2 的 PUBCOMP 报文。 */
 uint1 MQTT_PacketPublishComp(uint16 pkt_id, MQTT_PACKET_STRUCTURE *mqttPacket)
 {
 
@@ -1289,17 +1082,15 @@ uint1 MQTT_PacketPublishComp(uint16 pkt_id, MQTT_PACKET_STRUCTURE *mqttPacket)
     if(mqttPacket->_data == NULL)
         return 1;
 
-/*************************************固定头部***********************************************/
 
-    //固定头部----------------------头部消息-------------------------------------------------
+    /* 固定头部：头部消息 */
     mqttPacket->_data[mqttPacket->_len++] = MQTT_PKT_PUBCOMP << 4;
 
-    //固定头部----------------------剩余长度-------------------------------------------------
+    /* 固定头部：剩余长度 */
     mqttPacket->_data[mqttPacket->_len++] = 2;
 
-/*************************************可变头部***********************************************/
 
-    //可变头部----------------------pkt_id长度-----------------------------------------------
+    /* 可变头部：报文编号长度 */
     mqttPacket->_data[mqttPacket->_len++] = pkt_id >> 8;
     mqttPacket->_data[mqttPacket->_len++] = pkt_id & 0xff;
 
@@ -1307,17 +1098,7 @@ uint1 MQTT_PacketPublishComp(uint16 pkt_id, MQTT_PACKET_STRUCTURE *mqttPacket)
 
 }
 
-//==========================================================
-//    函数名称：    MQTT_UnPacketPublishComp
-//
-//    函数功能：    Publish Comp消息解包
-//
-//    入口参数：    rev_data：接收到的数据
-//
-//    返回参数：    0-成功        1-失败
-//
-//    说明：
-//==========================================================
+/* 解析 PUBCOMP。 */
 uint1 MQTT_UnPacketPublishComp(uint8 *rev_data)
 {
 
@@ -1331,17 +1112,7 @@ uint1 MQTT_UnPacketPublishComp(uint8 *rev_data)
 
 }
 
-//==========================================================
-//    函数名称：    MQTT_PacketPing
-//
-//    函数功能：    心跳请求组包
-//
-//    入口参数：    mqttPacket：包指针
-//
-//    返回参数：    0-成功        1-失败
-//
-//    说明：
-//==========================================================
+/* 组装 PINGREQ 报文。 */
 uint1 MQTT_PacketPing(MQTT_PACKET_STRUCTURE *mqttPacket)
 {
 
@@ -1349,12 +1120,11 @@ uint1 MQTT_PacketPing(MQTT_PACKET_STRUCTURE *mqttPacket)
     if(mqttPacket->_data == NULL)
         return 1;
 
-/*************************************固定头部***********************************************/
 
-    //固定头部----------------------头部消息-------------------------------------------------
+    /* 固定头部：头部消息 */
     mqttPacket->_data[mqttPacket->_len++] = MQTT_PKT_PINGREQ << 4;
 
-    //固定头部----------------------剩余长度-------------------------------------------------
+    /* 固定头部：剩余长度 */
     mqttPacket->_data[mqttPacket->_len++] = 0;
 
     return 0;

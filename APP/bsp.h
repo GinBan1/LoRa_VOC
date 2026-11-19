@@ -13,7 +13,6 @@
 #include "rtos_app.h"
 #include "app_environment.h"
 #include "data_logger.h"
-#include "tinyml_app.h"
 #include "sx1268_radio.h"
 #include "lora_app.h"
 #include "telemetry_packet.h"
@@ -21,7 +20,7 @@
 #include "sensirion_gas_index_algorithm.h"
 #include "BME680.h"
 #include "bme68x.h"
-#include "BME68X_DEFS.h"
+#include "bme68x_defs.h"
 #include "oled.h"
 
 #endif

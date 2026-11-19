@@ -5,12 +5,14 @@
 #include "bme68x.h"
 #include "data_logger.h"
 #include "main.h"
-#include "sensirion_gas_index_algorithm.h"
 
 #include <stdio.h>
 
 extern Environment_Data_t g_env_data;
-extern GasIndexAlgorithmParams voc_params;
+
+static uint32_t environment_last_sample_ms;
+static uint32_t environment_sample_sequence;
+static SGP40_VOCSnapshot_t environment_voc_snapshot;
 
 static void environment_read_sensors(void)
 {
@@ -40,7 +42,7 @@ static void environment_read_sensors(void)
     if (sgp40_raw != 0U)
     {
         int32_t voc_index = 0;
-        GasIndexAlgorithm_process(&voc_params, sgp40_raw, &voc_index);
+        (void)SGP40_ProcessVOC(sgp40_raw, &voc_index);
         g_env_data.voc_index = voc_index;
         g_env_data.sgp40_raw = sgp40_raw;
         g_env_data.sgp40_valid = 1U;
@@ -56,11 +58,32 @@ static void environment_read_sensors(void)
 
 void Environment_App_Init(void)
 {
+    environment_last_sample_ms = 0U;
+    environment_sample_sequence = 0U;
     GasIndexAlgorithmParams_Init();
+    SGP40_GetSnapshot(&environment_voc_snapshot);
     BME680_Hardware_Init();
 }
 
 void Environment_App_Task(void)
 {
     environment_read_sensors();
+    environment_last_sample_ms = HAL_GetTick();
+    SGP40_GetSnapshot(&environment_voc_snapshot);
+    environment_sample_sequence++;
+}
+
+uint32_t Environment_App_GetLastSampleMs(void)
+{
+    return environment_last_sample_ms;
+}
+
+uint32_t Environment_App_GetSampleSequence(void)
+{
+    return environment_sample_sequence;
+}
+
+void Environment_App_GetVocSnapshot(SGP40_VOCSnapshot_t *snapshot)
+{
+    if (snapshot != NULL) *snapshot = environment_voc_snapshot;
 }

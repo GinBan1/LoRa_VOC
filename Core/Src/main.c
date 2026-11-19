@@ -27,6 +27,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "bsp.h"
+#include "app_clk.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -59,6 +60,26 @@ void MX_FREERTOS_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+#if APP_HCLK_MHZ == 84
+static HAL_StatusTypeDef clk_slow(void)
+{
+  RCC_ClkInitTypeDef clk = {0};
+  HAL_StatusTypeDef rc;
+
+  /* 仅调整 HCLK，保留 PLL、主时钟、电压档位、Flash 等待周期和 APB 频率。 */
+  clk.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  clk.AHBCLKDivider = RCC_SYSCLK_DIV2;
+  clk.APB1CLKDivider = RCC_HCLK_DIV2;
+  clk.APB2CLKDivider = RCC_HCLK_DIV1;
+  rc = HAL_RCC_ClockConfig(&clk, FLASH_LATENCY_5);
+  if (rc != HAL_OK) return rc;
+
+  if (HAL_RCC_GetSysClockFreq() != 168000000U || HAL_RCC_GetHCLKFreq() != 84000000U ||
+      HAL_RCC_GetPCLK1Freq() != 42000000U || HAL_RCC_GetPCLK2Freq() != 84000000U)
+    return HAL_ERROR;
+  return HAL_OK;
+}
+#endif
 
 /* USER CODE END 0 */
 
@@ -70,11 +91,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-  /*
-   * Keil Debug may configure VTOR before running to main, while a standalone
-   * hardware reset restores VTOR to its reset value.  Point it explicitly at
-   * the application vector table before HAL enables the TIM6 time-base IRQ.
-   */
+  /* 上电时先设置向量表，再启用 HAL 的 TIM6 时基中断。 */
   SCB->VTOR = FLASH_BASE;
   __DSB();
   __ISB();
@@ -93,7 +110,9 @@ int main(void)
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
+#if APP_HCLK_MHZ == 84
+  if (clk_slow() != HAL_OK) Error_Handler();
+#endif
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
